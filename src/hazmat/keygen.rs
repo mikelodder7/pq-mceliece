@@ -188,10 +188,16 @@ fn mat_gen<P: Params>(
             return false;
         }
 
+        // Columns before this pivot are already reduced: every row holds a single one in its
+        // own pivot column and zeros elsewhere, so the words covering them contribute nothing
+        // and can be skipped. The saving is bounded by the width of the identity block, `mt`
+        // out of `n` columns, so it is worth about a tenth of the elimination on average.
+        let first_word = row / 64;
+
         // Pull a nonzero pivot up from the rows below without branching on which one.
         for k in row + 1..P::PK_NROWS {
             let mask = 0u64.wrapping_sub(mat.bit(row, row) ^ mat.bit(k, row));
-            mat.add_row(row, k, mask);
+            mat.add_row(row, k, mask, first_word);
         }
 
         if mat.bit(row, row) == 0 {
@@ -202,7 +208,7 @@ fn mat_gen<P: Params>(
         for k in 0..P::PK_NROWS {
             if k != row {
                 let mask = 0u64.wrapping_sub(mat.bit(k, row));
-                mat.add_row(k, row, mask);
+                mat.add_row(k, row, mask, first_word);
             }
         }
     }

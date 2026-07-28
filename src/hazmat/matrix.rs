@@ -75,24 +75,27 @@ impl BitMatrix {
         }
     }
 
-    /// Add `source` into `target`, gated by an all-ones or all-zeros `mask`.
+    /// Add `source` into `target` from word `first` onwards, gated by `mask`.
     ///
     /// This is the inner loop of Gaussian elimination and the reason rows are word aligned.
+    /// `first` lets the caller skip the leading words that elimination has already reduced to
+    /// zero in both rows; it depends only on how far the elimination has progressed, never on
+    /// the contents of the matrix, so skipping them is not a data-dependent shortcut.
     #[inline]
-    pub(crate) fn add_row(&mut self, target: usize, source: usize, mask: u64) {
+    pub(crate) fn add_row(&mut self, target: usize, source: usize, mask: u64, first: usize) {
         debug_assert_ne!(target, source);
         let stride = self.stride;
         let (target_words, source_words) = if target < source {
             let (head, tail) = self.data.split_at_mut(source * stride);
             (
-                &mut head[target * stride..target * stride + stride],
-                &tail[..stride],
+                &mut head[target * stride + first..target * stride + stride],
+                &tail[first..stride],
             )
         } else {
             let (head, tail) = self.data.split_at_mut(target * stride);
             (
-                &mut tail[..stride],
-                &head[source * stride..source * stride + stride],
+                &mut tail[first..stride],
+                &head[source * stride + first..source * stride + stride],
             )
         };
         for (dest, &src) in target_words.iter_mut().zip(source_words.iter()) {
@@ -223,11 +226,11 @@ mod tests {
 
             // A zero mask must leave the matrix untouched.
             let before: Vec<u64> = (0..columns).map(|b| m.bit(target, b)).collect();
-            m.add_row(target, source, 0);
+            m.add_row(target, source, 0, 0);
             let after: Vec<u64> = (0..columns).map(|b| m.bit(target, b)).collect();
             assert_eq!(before, after);
 
-            m.add_row(target, source, u64::MAX);
+            m.add_row(target, source, u64::MAX, 0);
             let rows = [&a, &b];
             for bit in 0..columns {
                 let t = (rows[target][bit / 8] >> (bit % 8)) & 1;
