@@ -8,7 +8,7 @@ use super::field::{Field, add, is_zero_mask};
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, HASH_REJECTION, hash_32};
 use super::keygen::load_private_key;
 use super::params::Params;
-use super::poly::{eval, eval_many};
+use super::poly::{EVAL_LANES, eval_many};
 
 /// Compute the length-`2t` syndrome of the received word `r` for the Goppa code `(g, alpha)`.
 ///
@@ -19,20 +19,54 @@ fn syndrome<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16], r: &[u8]
 
     out.fill(0);
 
-    for (i, &a) in support.iter().enumerate() {
-        // Selecting with a mask rather than multiplying by the bit saves `2t` field
-        // multiplications per position without introducing a branch.
-        let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
-        let select = 0u16.wrapping_sub(bit);
+    // Each position contributes the geometric series `w, w*a, w*a^2, ...`, which is a serial
+    // chain of multiplications. Positions are independent of one another, so several are
+    // advanced in lockstep to keep the multiplier busy.
+    let mut values = vec![0u16; support.len()];
+    eval_many::<P>(&mut values, goppa, support);
 
-        let value = eval::<P>(goppa, a);
-        let mut weight = P::Field::inv(P::Field::mul(value, value));
+    let mut points = support.chunks_exact(EVAL_LANES);
+    let mut chunk_index = 0;
+
+    for args in points.by_ref() {
+        let mut weight = [0u16; EVAL_LANES];
+        for (lane, w) in weight.iter_mut().enumerate() {
+            let i = chunk_index + lane;
+            // Folding the selection bit into the first term rather than into every term
+            // saves `2t` masking operations per position, and is equivalent because the
+            // whole series is scaled by it.
+            let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
+            let select = 0u16.wrapping_sub(bit);
+            let value = values[i];
+            *w = P::Field::inv(P::Field::mul(value, value)) & select;
+        }
 
         for slot in out.iter_mut() {
-            *slot = add(*slot, weight & select);
+            let mut acc = 0u16;
+            for (w, &a) in weight.iter_mut().zip(args.iter()) {
+                acc = add(acc, *w);
+                *w = P::Field::mul(*w, a);
+            }
+            *slot = add(*slot, acc);
+        }
+        chunk_index += EVAL_LANES;
+    }
+
+    for (lane, &a) in points.remainder().iter().enumerate() {
+        let i = chunk_index + lane;
+        let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
+        let select = 0u16.wrapping_sub(bit);
+        let value = values[i];
+        let mut weight = P::Field::inv(P::Field::mul(value, value)) & select;
+
+        for slot in out.iter_mut() {
+            *slot = add(*slot, weight);
             weight = P::Field::mul(weight, a);
         }
     }
+
+    use zeroize::Zeroize;
+    values.zeroize();
 }
 
 /// Berlekamp-Massey: recover the error locator polynomial from a syndrome.

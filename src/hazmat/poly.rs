@@ -123,10 +123,33 @@ pub(crate) fn eval<P: Params>(f: &[u16], a: u16) -> u16 {
     r
 }
 
+/// How many independent evaluations to interleave.
+///
+/// Horner's rule is a serial chain of multiplications, so evaluating one point at a time runs
+/// at the latency of the field multiplier rather than its throughput. Evaluating several
+/// points in lockstep fills the pipeline; eight is enough to cover the latency of both the
+/// carry-less-multiply and the portable multiplier without running out of registers.
+pub(crate) const EVAL_LANES: usize = 8;
+
 /// Evaluate `f` at every element of `support`, writing the results to `out`.
 pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) {
     debug_assert_eq!(out.len(), support.len());
-    for (dest, &a) in out.iter_mut().zip(support.iter()) {
+
+    let mut chunks = out.chunks_exact_mut(EVAL_LANES);
+    let mut points = support.chunks_exact(EVAL_LANES);
+
+    for (dest, args) in chunks.by_ref().zip(points.by_ref()) {
+        let mut acc = [f[P::T]; EVAL_LANES];
+        for i in (0..P::T).rev() {
+            let coefficient = f[i];
+            for (r, &a) in acc.iter_mut().zip(args.iter()) {
+                *r = add(P::Field::mul(*r, a), coefficient);
+            }
+        }
+        dest.copy_from_slice(&acc);
+    }
+
+    for (dest, &a) in chunks.into_remainder().iter_mut().zip(points.remainder()) {
         *dest = eval::<P>(f, a);
     }
 }
