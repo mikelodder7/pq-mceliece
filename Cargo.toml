@@ -1,0 +1,129 @@
+[package]
+authors = ["Michael Lodder <redmike7@gmail.com>"]
+categories = ["cryptography"]
+description = "A pure rust implementation of the Classic McEliece post-quantum KEM"
+documentation = "https://docs.rs/pq-mceliece"
+edition = "2024"
+exclude = ["tests/**", "benches/**", "examples/**", ".github/**"]
+homepage = "https://crates.io/crates/pq-mceliece"
+keywords = ["post", "quantum", "kem", "mceliece"]
+license = "Apache-2.0 OR MIT"
+name = "pq-mceliece"
+readme = "README.md"
+repository = "https://github.com/mikelodder7/pq-mceliece"
+version = "0.1.0"
+
+[features]
+default = ["nist", "iso", "serde"]
+
+# The ten parameter sets in the NIST round-4 submission.
+nist = [
+    "mceliece348864",
+    "mceliece348864f",
+    "mceliece460896",
+    "mceliece460896f",
+    "mceliece6688128",
+    "mceliece6688128f",
+    "mceliece6960119",
+    "mceliece6960119f",
+    "mceliece8192128",
+    "mceliece8192128f",
+]
+
+# The sixteen parameter sets standardized by ISO in June 2026.
+iso = [
+    "mceliece460896",
+    "mceliece460896f",
+    "mceliece460896pc",
+    "mceliece460896pcf",
+    "mceliece6688128",
+    "mceliece6688128f",
+    "mceliece6688128pc",
+    "mceliece6688128pcf",
+    "mceliece6960119",
+    "mceliece6960119f",
+    "mceliece6960119pc",
+    "mceliece6960119pcf",
+    "mceliece8192128",
+    "mceliece8192128f",
+    "mceliece8192128pc",
+    "mceliece8192128pcf",
+]
+
+# The plaintext-confirmation parameter sets. ISO only; not part of the NIST submission.
+pc = [
+    "mceliece460896pc",
+    "mceliece460896pcf",
+    "mceliece6688128pc",
+    "mceliece6688128pcf",
+    "mceliece6960119pc",
+    "mceliece6960119pcf",
+    "mceliece8192128pc",
+    "mceliece8192128pcf",
+]
+
+mceliece348864 = []
+mceliece348864f = []
+mceliece460896 = []
+mceliece460896f = []
+mceliece460896pc = []
+mceliece460896pcf = []
+mceliece6688128 = []
+mceliece6688128f = []
+mceliece6688128pc = []
+mceliece6688128pcf = []
+mceliece6960119 = []
+mceliece6960119f = []
+mceliece6960119pc = []
+mceliece6960119pcf = []
+mceliece8192128 = []
+mceliece8192128f = []
+mceliece8192128pc = []
+mceliece8192128pcf = []
+
+hazmat = []
+serde = ["dep:hex", "dep:serde"]
+
+[dependencies]
+ctutils = "0.4"
+hex = { version = "0.4", optional = true }
+hybrid-array = { version = "0.4.13", features = ["extra-sizes"] }
+kem = "0.3"
+rand_core = "0.10"
+serde = { version = "1.0", features = ["derive"], optional = true }
+serdect = "0.4"
+shake = "0.1"
+thiserror = "2.0"
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+zeroize = { version = "1", features = ["aarch64"] }
+
+[target.'cfg(any(target_arch = "x86_64", target_arch = "x86"))'.dependencies]
+zeroize = { version = "1", features = ["simd"] }
+
+[target.'cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))'.dependencies]
+zeroize = "1"
+
+[dev-dependencies]
+aes = "0.9"
+criterion = "0.8"
+hex = "0.4"
+hybrid-array = "0.4"
+postcard = { version = "1.0", features = ["use-std"] }
+rand = { version = "0.10", features = ["sys_rng"] }
+rand_chacha = "0.10"
+rstest = "0.26"
+serde_bare = "0.5"
+serde_cbor = "0.11"
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "1.1.0"
+
+[package.metadata.docs.rs]
+features = ["nist", "iso", "hazmat", "serde"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "mceliece"
+harness = false
+path = "benches/mceliece.rs"
