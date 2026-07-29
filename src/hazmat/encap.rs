@@ -11,9 +11,9 @@ use super::params::Params;
 
 /// All ones when `x == y`, all zeros otherwise.
 #[inline]
-fn same_mask_u8(x: u16, y: u16) -> u8 {
+fn same_mask(x: u16, y: u16) -> u64 {
     let mask = ((x ^ y) as u32).wrapping_sub(1) >> 31;
-    0u8.wrapping_sub(mask as u8)
+    0u64.wrapping_sub(mask as u64)
 }
 
 /// Whether every padding bit of an encapsulation key is zero.
@@ -76,13 +76,19 @@ pub(crate) fn fixed_weight<P: Params>(e: &mut [u8], mut rng: impl CryptoRng) {
         }
     }
 
-    let bits: Vec<u8> = indices.iter().map(|&index| 1u8 << (index & 7)).collect();
-    for (i, slot) in e.iter_mut().enumerate() {
-        let mut byte = 0u8;
-        for (j, &index) in indices.iter().enumerate() {
-            byte |= bits[j] & same_mask_u8(i as u16, index >> 3);
+    // Setting the chosen bits has to touch every position for every index, or which byte an
+    // index landed in would leak. Comparing a whole word at a time rather than a byte at a
+    // time does that in an eighth of the comparisons.
+    let bits: Vec<u64> = indices.iter().map(|&index| 1u64 << (index & 63)).collect();
+    let homes: Vec<u16> = indices.iter().map(|&index| index >> 6).collect();
+
+    for (w, chunk) in e.chunks_mut(8).enumerate() {
+        let mut word = 0u64;
+        for (&bit, &home) in bits.iter().zip(homes.iter()) {
+            word |= bit & same_mask(w as u16, home);
         }
-        *slot = byte;
+        let bytes = word.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
     }
 }
 
@@ -123,21 +129,29 @@ pub(crate) fn encode<P: Params>(syndrome: &mut [u8], pk: &[u8], e: &[u8]) {
     }
 
     syndrome.fill(0);
-    let mut row_words = vec![0u64; words];
     for i in 0..P::PK_NROWS {
         let row = &pk[i * P::PK_ROW_BYTES..(i + 1) * P::PK_ROW_BYTES];
-        for (w, slot) in row_words.iter_mut().enumerate() {
+
+        // Each whole word of the row is a fixed eight-byte copy, which compiles to one load.
+        // Deriving the length per word instead, as a `min` against what is left of the row,
+        // turns every one of them into a variable-length copy and costs an order of magnitude.
+        let mut acc = 0u64;
+        let mut chunks = row.chunks_exact(8);
+        for (group, mask) in chunks.by_ref().zip(tail.iter()) {
             let mut buf = [0u8; 8];
-            let at = w * 8;
-            let take = (row.len() - at).min(8);
-            buf[..take].copy_from_slice(&row[at..at + take]);
-            *slot = u64::from_le_bytes(buf);
+            buf.copy_from_slice(group);
+            acc ^= u64::from_le_bytes(buf) & mask;
         }
 
-        let mut acc = 0u64;
-        for (a, b) in row_words.iter().zip(tail.iter()) {
-            acc ^= a & b;
+        // A row whose length is not a multiple of eight leaves a short tail, which pairs with
+        // the last mask word. The length is a parameter set constant, never secret.
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rest.len()].copy_from_slice(rest);
+            acc ^= u64::from_le_bytes(buf) & tail[words - 1];
         }
+
         let bit = (acc.count_ones() as u8 & 1) ^ ((e[i / 8] >> (i % 8)) & 1);
         syndrome[i / 8] |= bit << (i % 8);
     }
@@ -200,10 +214,10 @@ mod tests {
 
     #[test]
     fn same_mask_is_all_or_nothing() {
-        assert_eq!(same_mask_u8(0, 0), 0xFF);
-        assert_eq!(same_mask_u8(0xFFFF, 0xFFFF), 0xFF);
-        assert_eq!(same_mask_u8(1, 0), 0);
-        assert_eq!(same_mask_u8(0, 0xFFFF), 0);
+        assert_eq!(same_mask(0, 0), u64::MAX);
+        assert_eq!(same_mask(0xFFFF, 0xFFFF), u64::MAX);
+        assert_eq!(same_mask(1, 0), 0);
+        assert_eq!(same_mask(0, 0xFFFF), 0);
     }
 
     #[cfg(any(
