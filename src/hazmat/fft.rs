@@ -51,102 +51,15 @@ fn taylor(g: &mut [u16]) {
     taylor(high);
 }
 
-/// Evaluate `f` at `point` by Horner's rule.
-fn eval_at<F: Field>(f: &[u16], point: u16) -> u16 {
-    let mut acc = 0u16;
-    for &coefficient in f.iter().rev() {
-        acc = F::mul(acc, point) ^ coefficient;
-    }
-    acc
-}
-
-/// Evaluate `f` over the affine subspace `offset + span(basis)`.
-///
-/// `out` receives `2^basis.len()` values, with index `j` holding the evaluation at
-/// `offset + sum_i bit_i(j) * basis[i]`. `f` must have a power-of-two number of coefficients.
-fn transform<F: Field>(out: &mut [u16], f: &[u16], basis: &[u16], offset: u16) {
-    debug_assert_eq!(out.len(), 1 << basis.len());
-    debug_assert!(f.len().is_power_of_two());
-
-    if basis.is_empty() {
-        out[0] = eval_at::<F>(f, offset);
-        return;
-    }
-    if f.len() == 1 {
-        // A constant takes the same value everywhere, which prunes the recursion as soon as
-        // the polynomial runs out of degree.
-        out.fill(f[0]);
-        return;
-    }
-
-    let levels = basis.len();
-    let beta = basis[levels - 1];
-    let beta_inv = F::inv(beta);
-
-    // g(x) = f(beta * x), so that the top basis element becomes one.
-    let mut g = vec![0u16; f.len()];
-    let mut power = 1u16;
-    for (slot, &coefficient) in g.iter_mut().zip(f.iter()) {
-        *slot = F::mul(coefficient, power);
-        power = F::mul(power, beta);
-    }
-
-    taylor(&mut g);
-    let half = g.len() / 2;
-    let mut even = vec![0u16; half];
-    let mut odd = vec![0u16; half];
-    for i in 0..half {
-        even[i] = g[2 * i];
-        odd[i] = g[2 * i + 1];
-    }
-
-    // The image basis: tau(gamma_i) for gamma_i = basis_i / beta.
-    let gamma: Vec<u16> = basis[..levels - 1]
-        .iter()
-        .map(|&b| F::mul(b, beta_inv))
-        .collect();
-    let image: Vec<u16> = gamma.iter().map(|&g| F::sq(g) ^ g).collect();
-
-    let shifted = F::mul(offset, beta_inv);
-    let image_offset = F::sq(shifted) ^ shifted;
-
-    let sub = 1usize << (levels - 1);
-    let mut low = vec![0u16; sub];
-    let mut high = vec![0u16; sub];
-    transform::<F>(&mut low, &even, &image, image_offset);
-    transform::<F>(&mut high, &odd, &image, image_offset);
-
-    // `omega` walks the subspace in index order, maintained incrementally rather than rebuilt.
-    // Counting from `j - 1` to `j` clears the trailing ones and sets the bit at
-    // `j.trailing_zeros()`, so the delta is the prefix exclusive-or up to that bit. The bit
-    // index depends only on the loop counter, never on secret data.
-    let mut prefix = vec![0u16; gamma.len()];
-    let mut running = 0u16;
-    for (slot, &g) in prefix.iter_mut().zip(gamma.iter()) {
-        running ^= g;
-        *slot = running;
-    }
-
-    let mut omega = shifted;
-    for j in 0..sub {
-        if j != 0 {
-            omega ^= prefix[j.trailing_zeros() as usize];
-        }
-        out[j] = low[j] ^ F::mul(omega, high[j]);
-        out[j + sub] = out[j] ^ high[j];
-    }
-}
-
 /// Evaluate `f` at every element of `F_q`, writing `out[a] = f(a)`.
 ///
-/// `f` holds coefficients in ascending order and may be any length up to `q`. The decoder uses
-/// [`eval_all_bitrev`] instead; this natural ordering is the one the tests state correctness
-/// against.
+/// The decoder uses [`eval_all_bitrev`]; this natural ordering is what the tests state
+/// correctness against.
 #[cfg(test)]
 pub(crate) fn eval_all<P: Params>(out: &mut [u16], f: &[u16]) {
     // The standard basis makes the output index equal the field element it evaluates at.
     let basis: Vec<u16> = (0..P::M).map(|i| 1u16 << i).collect();
-    evaluate::<P>(out, f, &basis);
+    evaluate::<P>(out, f, basis);
 }
 
 /// Evaluate `f` at every element of `F_q`, writing `out[k] = f(bitrev(k))`.
@@ -157,23 +70,120 @@ pub(crate) fn eval_all<P: Params>(out: &mut [u16], f: &[u16]) {
 /// secret-dependent lookup.
 pub(crate) fn eval_all_bitrev<P: Params>(out: &mut [u16], f: &[u16]) {
     let basis: Vec<u16> = (0..P::M).map(|i| 1u16 << (P::M - 1 - i)).collect();
-    evaluate::<P>(out, f, &basis);
+    evaluate::<P>(out, f, basis);
 }
 
-fn evaluate<P: Params>(out: &mut [u16], f: &[u16], basis: &[u16]) {
+/// Evaluate `f` over all of `F_q`, with output index `j` holding the evaluation at
+/// `sum_i bit_i(j) * basis[i]`.
+///
+/// The transform is written as two flat passes rather than as a recursion. Every node at a
+/// given depth shares the same basis and the same zero offset, so all the per-node quantities
+/// the recursive form recomputes are in fact per-level constants, and the coefficient blocks
+/// can live side by side in one array instead of in separately allocated halves.
+fn evaluate<P: Params>(out: &mut [u16], f: &[u16], mut basis: Vec<u16>) {
     debug_assert_eq!(out.len(), P::Q);
 
-    // The recursion halves the coefficient count at each level, so it wants a power of two.
-    let mut padded = vec![0u16; f.len().next_power_of_two()];
-    padded[..f.len()].copy_from_slice(f);
+    let length = f.len().next_power_of_two();
+    let levels = length.trailing_zeros() as usize;
+    debug_assert!(levels <= P::M);
 
-    transform::<P::Field>(out, &padded, basis, 0);
+    let mut coefficients = vec![0u16; length];
+    coefficients[..f.len()].copy_from_slice(f);
+
+    // Coefficient pass: rescale, rewrite in powers of tau, and split even from odd digits.
+    // After `levels` rounds each entry is the constant one leaf of the recursion would see.
+    let mut scratch = vec![0u16; length];
+    let mut gammas: Vec<Vec<u16>> = Vec::with_capacity(levels);
+
+    for depth in 0..levels {
+        let beta = basis[basis.len() - 1];
+        let beta_inverse = P::Field::inv(beta);
+        let block = length >> depth;
+        let half = block / 2;
+
+        for start in (0..length).step_by(block) {
+            let segment = &mut coefficients[start..start + block];
+
+            let mut power = 1u16;
+            for coefficient in segment.iter_mut() {
+                *coefficient = P::Field::mul(*coefficient, power);
+                power = P::Field::mul(power, beta);
+            }
+
+            taylor(segment);
+
+            for i in 0..half {
+                scratch[i] = segment[2 * i];
+                scratch[half + i] = segment[2 * i + 1];
+            }
+            segment.copy_from_slice(&scratch[..block]);
+        }
+
+        let gamma: Vec<u16> = basis[..basis.len() - 1]
+            .iter()
+            .map(|&b| P::Field::mul(b, beta_inverse))
+            .collect();
+        basis = gamma.iter().map(|&g| P::Field::sq(g) ^ g).collect();
+        gammas.push(gamma);
+    }
+
+    // Each leaf constant takes the same value across its whole output block.
+    let span = P::Q >> levels;
+    for (leaf, &constant) in coefficients.iter().enumerate() {
+        out[leaf * span..(leaf + 1) * span].fill(constant);
+    }
+
+    // Butterfly pass, deepest level first. `tau(w) = tau(w + 1)` in characteristic two, so the
+    // two halves of a block share a sub-evaluation and differ only by the top basis element.
+    let mut prefix = [0u16; 16];
+
+    for depth in (0..levels).rev() {
+        let gamma = &gammas[depth];
+        let block = P::Q >> depth;
+        let half = block / 2;
+        debug_assert_eq!(half, 1 << gamma.len());
+
+        // Walking `j` upwards, the selected basis elements change by a prefix exclusive-or:
+        // counting from `j - 1` clears the trailing ones and sets one more bit. Keeping the
+        // running sum in a local rather than a table keeps it in a register through the inner
+        // loop, which is the hottest one in the transform. Both indices are loop counters,
+        // never secret data.
+        let mut running = 0u16;
+        for (slot, &g) in prefix.iter_mut().zip(gamma.iter()) {
+            running ^= g;
+            *slot = running;
+        }
+
+        for start in (0..P::Q).step_by(block) {
+            let (low, high) = out[start..start + block].split_at_mut(half);
+
+            // The first point of every block selects no basis element at all.
+            high[0] ^= low[0];
+
+            let mut omega = 0u16;
+            for j in 1..half {
+                omega ^= prefix[j.trailing_zeros() as usize];
+                let top = high[j];
+                low[j] ^= P::Field::mul(omega, top);
+                high[j] = low[j] ^ top;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// Evaluate `f` at `point` by Horner's rule, as the independent oracle.
+    fn eval_at<F: Field>(f: &[u16], point: u16) -> u16 {
+        let mut acc = 0u16;
+        for &coefficient in f.iter().rev() {
+            acc = F::mul(acc, point) ^ coefficient;
+        }
+        acc
+    }
 
     struct Rng(u64);
 
