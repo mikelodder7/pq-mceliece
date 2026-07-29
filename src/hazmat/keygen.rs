@@ -204,6 +204,16 @@ fn mat_gen<P: Params>(
             return false;
         }
 
+        // One destination row at a time is not an oversight. This sweep is the single most
+        // expensive part of key generation and it already runs at about one vector operation
+        // per cycle, so the only thing left to cut is memory traffic. Driving four destinations
+        // together to load each pivot word once measured 7% slower, and precomputing the masks
+        // ahead of the sweep instead of reading each from the row it gates measured 19% slower
+        // because it adds a whole scattered pass over the matrix per pivot.
+        //
+        // Blocking over pivots, the usual answer, is not open to us either: `move_columns` runs
+        // partway through this loop and reads the half-eliminated matrix, so reordering pivots
+        // would change the keys the `f` variants produce.
         for k in 0..P::PK_NROWS {
             if k != row {
                 let mask = 0u64.wrapping_sub(mat.bit(k, row));
