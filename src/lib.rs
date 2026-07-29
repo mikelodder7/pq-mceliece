@@ -87,9 +87,25 @@
 //!
 //! ## Features
 //!
+//! Parameter sets and operations are selected independently.
+//!
 //! Each parameter set has its own feature, and the `nist`, `iso` and `pc` groups enable the
-//! corresponding sets. The `serde` feature adds serialization for every value type, and
-//! `hazmat` makes the low-level layer public.
+//! corresponding sets.
+//!
+//! The three operations are `keygen`, `encapsulate` and `decapsulate`. At least one must be
+//! enabled, and a build only carries the code and dependencies the enabled ones reach.
+//! Encapsulation is much the lightest: `Encode` is pure bit manipulation over the public key,
+//! so an encapsulate-only build contains no field arithmetic, no polynomial arithmetic, no
+//! matrix reduction, no sorting networks and no Beneš network.
+//!
+//! | feature | effect |
+//! | ------- | ------ |
+//! | `keygen` | `KeyGen` and `SeededKeyGen`, and recovering a public key from a private one |
+//! | `encapsulate` | `Encap` |
+//! | `decapsulate` | `Decap` |
+//! | `kem` | the [`kem`](https://docs.rs/kem) crate traits; implies all three operations |
+//! | `serde` | serialization for every value type |
+//! | `hazmat` | makes the low-level layer public |
 #![warn(
     missing_docs,
     missing_debug_implementations,
@@ -123,9 +139,16 @@
 )))]
 compile_error!("no Classic McEliece parameter set feature is enabled");
 
+#[cfg(not(any(feature = "keygen", feature = "encapsulate", feature = "decapsulate")))]
+compile_error!(
+    "no Classic McEliece operation feature is enabled; \
+     select at least one of `keygen`, `encapsulate` or `decapsulate`"
+);
+
 mod error;
 pub use error::*;
 
+#[cfg(feature = "kem")]
 pub mod kem;
 
 #[cfg(feature = "hazmat")]
@@ -134,7 +157,10 @@ pub mod hazmat;
 mod hazmat;
 
 use ctutils::{Choice, CtEq};
-use hazmat::{Kem, Params};
+#[cfg(any(feature = "keygen", feature = "encapsulate", feature = "decapsulate"))]
+use hazmat::Kem;
+use hazmat::Params;
+#[cfg(any(feature = "keygen", feature = "encapsulate"))]
 use rand_core::CryptoRng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -653,13 +679,28 @@ macro_rules! zeroize_on_drop {
 zeroize_on_drop!(DecapsulationKey);
 zeroize_on_drop!(SharedSecret);
 
+#[cfg(feature = "encapsulate")]
 impl EncapsulationKey {
+    /// Whether every padding bit is zero.
+    ///
+    /// [`encapsulate`](Self::encapsulate) rejects a key that fails this check. Parameter sets
+    /// whose `k` is a multiple of eight have no padding, so this is always `true` for them.
+    pub fn padding_is_zero(&self) -> bool {
+        with_params!(&self.algorithm, P, {
+            match hazmat::EncapsulationKey::<P>::from_slice(&self.value) {
+                Ok(key) => key.padding_is_zero(),
+                Err(_) => false,
+            }
+        })
+    }
+
     /// Encapsulate to this key, producing a ciphertext and the shared secret it transports.
     pub fn encapsulate(&self, rng: impl CryptoRng) -> McElieceResult<(Ciphertext, SharedSecret)> {
         self.algorithm.encapsulate(self, rng)
     }
 }
 
+#[cfg(feature = "keygen")]
 impl From<&DecapsulationKey> for EncapsulationKey {
     /// Recover the encapsulation key by rerunning key generation from the stored seed.
     ///
@@ -671,6 +712,35 @@ impl From<&DecapsulationKey> for EncapsulationKey {
     }
 }
 
+#[cfg(feature = "decapsulate")]
+impl Ciphertext {
+    /// Whether every padding bit is zero.
+    ///
+    /// [`DecapsulationKey::decapsulate`] rejects a ciphertext that fails this check. Parameter
+    /// sets whose `mt` is a multiple of eight have no padding, so this is always `true` for
+    /// them.
+    pub fn padding_is_zero(&self) -> bool {
+        with_params!(&self.algorithm, P, {
+            match hazmat::Ciphertext::<P>::from_slice(&self.value) {
+                Ok(ct) => ct.padding_is_zero(),
+                Err(_) => false,
+            }
+        })
+    }
+}
+
+impl DecapsulationKey {
+    /// The 32-byte seed this key was generated from.
+    ///
+    /// Knowing the seed is equivalent to knowing the whole private key, so treat it with the
+    /// same care. Storing the seed instead of the key trades a full key generation for a
+    /// factor of several hundred in storage.
+    pub fn seed(&self) -> &[u8] {
+        with_params!(&self.algorithm, P, { hazmat::seed_of::<P>(&self.value) })
+    }
+}
+
+#[cfg(feature = "decapsulate")]
 impl DecapsulationKey {
     /// Recover the shared secret from a ciphertext.
     ///
@@ -710,6 +780,8 @@ impl Algorithm {
     }
 
     /// Generate a key pair, drawing a fresh seed from `rng`.
+    #[cfg(feature = "keygen")]
+    #[cfg(feature = "keygen")]
     pub fn generate_keypair(&self, rng: impl CryptoRng) -> (EncapsulationKey, DecapsulationKey) {
         with_params!(self, P, {
             let (ek, dk) = <P as Kem>::generate_keypair(rng);
@@ -730,6 +802,8 @@ impl Algorithm {
     ///
     /// The seed must come from a cryptographically secure source and is exactly as sensitive
     /// as the resulting private key.
+    #[cfg(feature = "keygen")]
+    #[cfg(feature = "keygen")]
     pub fn generate_keypair_from_seed<B: AsRef<[u8]>>(
         &self,
         seed: B,
@@ -750,6 +824,7 @@ impl Algorithm {
     }
 
     /// Encapsulate to `key`, producing a ciphertext and the shared secret it transports.
+    #[cfg(feature = "encapsulate")]
     pub fn encapsulate(
         &self,
         key: &EncapsulationKey,
@@ -780,6 +855,7 @@ impl Algorithm {
     /// implicitly: the returned secret is derived from the private key's rejection string, so
     /// it is unpredictable without the private key and identical every time the same bad
     /// ciphertext is presented.
+    #[cfg(feature = "decapsulate")]
     pub fn decapsulate(
         &self,
         key: &DecapsulationKey,
@@ -800,6 +876,8 @@ impl Algorithm {
     }
 
     /// Recover an encapsulation key from a decapsulation key.
+    #[cfg(feature = "keygen")]
+    #[cfg(feature = "keygen")]
     pub fn encapsulation_key_from_decapsulation_key(
         &self,
         key: &DecapsulationKey,
@@ -888,7 +966,12 @@ impl<'de> serde::Deserialize<'de> for Algorithm {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "keygen",
+    feature = "encapsulate",
+    feature = "decapsulate"
+))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

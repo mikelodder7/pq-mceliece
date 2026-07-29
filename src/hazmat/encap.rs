@@ -6,7 +6,6 @@
 
 use rand_core::CryptoRng;
 
-use super::field::Field;
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, hash_32};
 use super::params::Params;
 
@@ -54,7 +53,7 @@ pub(crate) fn fixed_weight<P: Params>(e: &mut [u8], mut rng: impl CryptoRng) {
             if count == P::T {
                 break;
             }
-            let candidate = u16::from_le_bytes([chunk[0], chunk[1]]) & P::Field::MASK;
+            let candidate = u16::from_le_bytes([chunk[0], chunk[1]]) & P::GFMASK;
             if (candidate as usize) < P::N {
                 indices[count] = candidate;
                 count += 1;
@@ -303,9 +302,6 @@ mod tests {
         use crate::hazmat::params::McEliece8192128;
         // `n == q` means every drawn index is in range, so `tau` collapses to `t`.
         assert_eq!(McEliece8192128::TAU, McEliece8192128::T);
-        assert_eq!(
-            McEliece8192128::N,
-            1 << <McEliece8192128 as Params>::Field::BITS
-        );
+        assert_eq!(McEliece8192128::N, 1 << McEliece8192128::M);
     }
 }

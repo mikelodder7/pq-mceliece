@@ -4,11 +4,27 @@
 */
 //! Decapsulation: syndrome computation, Berlekamp-Massey decoding and implicit rejection.
 
+use super::benes::support_gen;
 use super::field::{Field, add, is_zero_mask};
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, HASH_REJECTION, hash_32};
-use super::keygen::load_private_key;
 use super::params::Params;
 use super::poly::{EVAL_LANES, eval_many};
+
+/// Recover the support `alpha` and Goppa polynomial `g` from a private key.
+///
+/// `support` receives `n` elements and `goppa` receives `t + 1` coefficients with a leading 1.
+pub(crate) fn load_private_key<P: Params>(sk: &[u8], goppa: &mut [u16], support: &mut [u16]) {
+    debug_assert_eq!(goppa.len(), P::T + 1);
+    debug_assert_eq!(support.len(), P::N);
+
+    for (i, slot) in goppa.iter_mut().take(P::T).enumerate() {
+        let at = P::IRR_OFFSET + i * 2;
+        *slot = u16::from_le_bytes([sk[at], sk[at + 1]]) & P::Field::MASK;
+    }
+    goppa[P::T] = 1;
+
+    support_gen::<P>(support, &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES]);
+}
 
 /// Compute the length-`2t` syndrome of the received word `r` for the Goppa code `(g, alpha)`.
 ///
@@ -38,7 +54,7 @@ fn syndrome<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16], r: &[u8]
             let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
             let select = 0u16.wrapping_sub(bit);
             let value = values[i];
-            *w = P::Field::inv(P::Field::mul(value, value)) & select;
+            *w = P::Field::inv(P::Field::sq(value)) & select;
         }
 
         for slot in out.iter_mut() {
@@ -57,7 +73,7 @@ fn syndrome<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16], r: &[u8]
         let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
         let select = 0u16.wrapping_sub(bit);
         let value = values[i];
-        let mut weight = P::Field::inv(P::Field::mul(value, value)) & select;
+        let mut weight = P::Field::inv(P::Field::sq(value)) & select;
 
         for slot in out.iter_mut() {
             *slot = add(*slot, weight);
@@ -255,7 +271,7 @@ pub(crate) fn decapsulate<P: Params>(session_key: &mut [u8], ciphertext: &[u8], 
     padding_ok
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "keygen", feature = "encapsulate"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -317,7 +333,7 @@ mod tests {
 
         let mut goppa = vec![0u16; P::T + 1];
         let mut support = vec![0u16; P::N];
-        crate::hazmat::keygen::load_private_key::<P>(&sk, &mut goppa, &mut support);
+        load_private_key::<P>(&sk, &mut goppa, &mut support);
 
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([seed ^ 0x11; 32]);
         let mut e = vec![0u8; P::N_BYTES];
@@ -339,7 +355,7 @@ mod tests {
 
         let mut goppa = vec![0u16; P::T + 1];
         let mut support = vec![0u16; P::N];
-        crate::hazmat::keygen::load_private_key::<P>(&sk, &mut goppa, &mut support);
+        load_private_key::<P>(&sk, &mut goppa, &mut support);
 
         // All ones is not the syndrome of a weight-`t` vector for any of these codes.
         let mut c0 = vec![0xFFu8; P::SYND_BYTES];

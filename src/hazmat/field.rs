@@ -28,9 +28,6 @@ pub trait Field:
     /// The extension degree `m`, so that `q = 2^m`.
     const BITS: usize;
 
-    /// The number of elements `q = 2^m`.
-    const Q: usize = 1 << Self::BITS;
-
     /// A mask covering the `m` low bits.
     const MASK: Elem = (1 << Self::BITS) - 1;
 
@@ -43,12 +40,24 @@ pub trait Field:
     fn mul(a: Elem, b: Elem) -> Elem;
 
     /// Square a field element.
+    ///
+    /// Squaring only appears in two places: the inversion chain over `GF(2^12)`, and the
+    /// `g(alpha)^2` of the Goppa syndrome. `GF(2^13)` inverts through fused helpers instead,
+    /// so a key-generation-only build over that field never needs this.
+    #[cfg(any(
+        feature = "decapsulate",
+        feature = "mceliece348864",
+        feature = "mceliece348864f"
+    ))]
     fn sq(a: Elem) -> Elem;
 
     /// Invert a field element. `inv(0)` is defined to be `0`.
     fn inv(a: Elem) -> Elem;
 
     /// Compute `num / den`. `frac(0, num)` is defined to be `0`.
+    ///
+    /// Only Berlekamp-Massey divides, so this is only present with the `decapsulate` feature.
+    #[cfg(feature = "decapsulate")]
     fn frac(den: Elem, num: Elem) -> Elem {
         Self::mul(Self::inv(den), num)
     }
@@ -269,6 +278,11 @@ impl Field for Gf13 {
         Self::reduce(clmul(a & Self::MASK, b & Self::MASK))
     }
 
+    #[cfg(any(
+    feature = "decapsulate",
+    feature = "mceliece348864",
+    feature = "mceliece348864f"
+))]
     #[inline]
     fn sq(a: Elem) -> Elem {
         let mut x = (a & Self::MASK) as u32;
@@ -281,13 +295,24 @@ impl Field for Gf13 {
 
     #[inline]
     fn inv(a: Elem) -> Elem {
-        Self::frac(a, 1)
+        Self::divide(a, 1)
     }
 
+    #[cfg(feature = "decapsulate")]
     #[inline]
     fn frac(den: Elem, num: Elem) -> Elem {
-        // a^-1 = a^(2^13 - 2), exponent 1111111111110 in binary, built from repeated
-        // square-and-multiply steps that share the ^1111 intermediate.
+        Self::divide(den, num)
+    }
+}
+
+impl Gf13 {
+    /// Compute `num / den`, which is also how inversion is reached.
+    ///
+    /// `a^-1 = a^(2^13 - 2)`, exponent `1111111111110` in binary, built from repeated
+    /// square-and-multiply steps that share the `^1111` intermediate. Folding the numerator
+    /// into the final step makes division cost no more than inversion.
+    #[inline]
+    fn divide(den: Elem, num: Elem) -> Elem {
         let tmp_11 = Self::sqmul(den, den);
         let tmp_1111 = Self::sq2mul(tmp_11, tmp_11);
 
@@ -298,9 +323,7 @@ impl Field for Gf13 {
 
         Self::sqmul(out, num)
     }
-}
 
-impl Gf13 {
     /// Compute `a^4`, fusing two squarings into one reduction chain.
     #[inline]
     fn sq2(a: Elem) -> Elem {
@@ -430,16 +453,27 @@ mod tests {
                 assert_eq!(F::mul(a, b), reference_mul(a, b, F::BITS, poly));
                 assert_eq!(F::mul(b, a), reference_mul(b, a, F::BITS, poly));
             }
+            #[cfg(any(
+                feature = "decapsulate",
+                feature = "mceliece348864",
+                feature = "mceliece348864f"
+            ))]
             assert_eq!(F::sq(a), reference_mul(a, a, F::BITS, poly));
             assert_eq!(F::bitrev(F::bitrev(a)), a);
         }
 
         assert_eq!(F::inv(0), 0);
-        assert_eq!(F::frac(0, 7), 0);
         for a in 1..count {
             assert_eq!(F::mul(a, F::inv(a)), 1, "inverse of {a}");
-            for &num in probes.iter() {
-                assert_eq!(F::mul(F::frac(a, num), a), num, "{num} / {a}");
+        }
+
+        #[cfg(feature = "decapsulate")]
+        {
+            assert_eq!(F::frac(0, 7), 0);
+            for a in 1..count {
+                for &num in probes.iter() {
+                    assert_eq!(F::mul(F::frac(a, num), a), num, "{num} / {a}");
+                }
             }
         }
     }
@@ -486,6 +520,7 @@ mod tests {
         }
 
         /// The fused helpers exist only as a faster route to the same values.
+        #[cfg(feature = "decapsulate")]
         #[test]
         fn gf13_fused_products_agree_with_the_simple_forms() {
             for a in 0u16..8192 {

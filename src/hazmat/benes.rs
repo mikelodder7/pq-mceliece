@@ -287,7 +287,8 @@ pub(crate) fn support_gen<P: Params>(support: &mut [u16], cond: &[u8]) {
     }
 }
 
-#[cfg(test)]
+// The round-trip tests build control bits, which only key generation compiles.
+#[cfg(all(test, feature = "keygen"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

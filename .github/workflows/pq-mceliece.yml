@@ -45,6 +45,28 @@ jobs:
       - run: cargo build --no-default-features || [ $? -eq 101 ]
       - run: cargo build --all-features
 
+  # Every operation must build on its own, and drag in nothing the others need.
+  operations:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ops:
+          - keygen
+          - encapsulate
+          - decapsulate
+          - keygen,encapsulate
+          - keygen,decapsulate
+          - encapsulate,decapsulate
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - run: cargo build --no-default-features --features=nist,iso,${{ matrix.ops }}
+      - run: cargo test --no-default-features --features=nist,iso,${{ matrix.ops }} --release
+      # Selecting no operation at all must be a clear compile error.
+      - run: cargo build --no-default-features --features=nist || [ $? -eq 101 ]
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -54,7 +76,7 @@ jobs:
           toolchain: stable
       - run: cargo build --all-features --benches --release --keep-going
       - run: cargo test --all-features --release
-      - run: cargo test --no-default-features --features=nist,serde --release
+      - run: cargo test --no-default-features --features=nist,serde,keygen,encapsulate,decapsulate --release
 
   # The carry-less multiply paths are compiled out by default on x86-64, so build and test
   # them explicitly.
@@ -91,7 +113,7 @@ jobs:
           toolchain: nightly
       - uses: cargo-bins/cargo-binstall@main
       - run: cargo binstall --no-confirm cargo-careful
-      - run: cargo careful test --no-default-features --features=mceliece348864,mceliece6960119f --release
+      - run: cargo careful test --no-default-features --features=mceliece348864,mceliece6960119f,keygen,encapsulate,decapsulate --release
 
   clippy:
     runs-on: ubuntu-latest
@@ -102,7 +124,10 @@ jobs:
           toolchain: stable
           components: clippy
       - run: cargo clippy --all --all-features --all-targets -- -D warnings
-      - run: cargo clippy --all --no-default-features --features=nist,serde -- -D warnings
+      - run: cargo clippy --all --no-default-features --features=nist,serde,keygen,encapsulate,decapsulate -- -D warnings
+      - run: cargo clippy --all --no-default-features --features=nist,encapsulate -- -D warnings
+      - run: cargo clippy --all --no-default-features --features=nist,decapsulate -- -D warnings
+      - run: cargo clippy --all --no-default-features --features=nist,keygen -- -D warnings
 
   rustfmt:
     runs-on: ubuntu-latest

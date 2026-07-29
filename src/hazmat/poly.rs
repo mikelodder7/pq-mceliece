@@ -10,12 +10,15 @@
 //!   turn `t` random field elements into a monic irreducible degree-`t` polynomial;
 //! * `F_q[x]`, where the Goppa polynomial `g` lives and is evaluated at support elements.
 
-use super::field::{Field, add, is_zero_mask};
+#[cfg(feature = "keygen")]
+use super::field::is_zero_mask;
+use super::field::{Field, add};
 use super::params::Params;
 
 /// Multiply `a` by `b` in `F_q[y]/F(y)`, where both operands have `t` coefficients.
 ///
 /// `scratch` must hold at least `2t - 1` elements; it is used for the unreduced product.
+#[cfg(feature = "keygen")]
 pub(crate) fn mul_mod_f<P: Params>(out: &mut [u16], a: &[u16], b: &[u16], scratch: &mut [u16]) {
     let t = P::T;
     debug_assert_eq!(a.len(), t);
@@ -53,6 +56,7 @@ pub(crate) fn mul_mod_f<P: Params>(out: &mut [u16], a: &[u16], b: &[u16], scratc
 /// of the specification's `Irreducible` algorithm and makes key generation retry with a fresh
 /// seed. The `t` returned coefficients are `g_0, ..., g_(t-1)`; the leading coefficient is an
 /// implicit `1`.
+#[cfg(feature = "keygen")]
 pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool {
     let t = P::T;
     debug_assert_eq!(out.len(), t);
@@ -154,7 +158,7 @@ pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) 
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "keygen"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;

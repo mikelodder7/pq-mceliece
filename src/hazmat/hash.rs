@@ -11,6 +11,9 @@
 use shake::digest::{ExtendableOutput, Update};
 
 /// Domain byte for `Hash(0, e, C)`, the implicit-rejection session key.
+///
+/// Only decapsulation ever produces this input.
+#[cfg(feature = "decapsulate")]
 pub(crate) const HASH_REJECTION: u8 = 0;
 
 /// Domain byte for `Hash(1, e, C)`, the session key of a successful decode.
@@ -47,6 +50,7 @@ mod tests {
         assert_eq!(direct, split);
     }
 
+    #[cfg(feature = "decapsulate")]
     #[test]
     fn the_domain_bytes_separate_the_three_inputs() {
         let vector = [7u8; 16];

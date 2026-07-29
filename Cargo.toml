@@ -14,7 +14,19 @@ repository = "https://github.com/mikelodder7/pq-mceliece"
 version = "0.1.0"
 
 [features]
-default = ["nist", "iso", "serde"]
+default = ["nist", "iso", "serde", "keygen", "encapsulate", "decapsulate", "kem"]
+
+# The three KEM operations, selectable independently so that a build only carries the code
+# and dependencies it uses. At least one must be enabled.
+#
+# Encapsulation is by far the lightest: it needs no field arithmetic beyond a mask, and none
+# of the matrix, sorting, Benes network or control-bit machinery.
+keygen = ["dep:rand_core"]
+encapsulate = ["dep:rand_core"]
+decapsulate = []
+
+# Implementations of the `kem` crate traits, which cover all three operations at once.
+kem = ["dep:kem", "dep:hybrid-array", "keygen", "encapsulate", "decapsulate"]
 
 # The ten parameter sets in the NIST round-4 submission.
 nist = [
@@ -87,11 +99,10 @@ serde = ["dep:hex", "dep:serde"]
 [dependencies]
 ctutils = "0.4"
 hex = { version = "0.4", optional = true }
-hybrid-array = { version = "0.4.13", features = ["extra-sizes"] }
-kem = "0.3"
-rand_core = "0.10"
+hybrid-array = { version = "0.4.13", features = ["extra-sizes"], optional = true }
+kem = { version = "0.3", optional = true }
+rand_core = { version = "0.10", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
-serdect = "0.4"
 shake = "0.1"
 thiserror = "2.0"
 
@@ -120,10 +131,11 @@ serde_yaml = "0.9"
 toml = "1.1.0"
 
 [package.metadata.docs.rs]
-features = ["nist", "iso", "hazmat", "serde"]
+features = ["nist", "iso", "hazmat", "serde", "keygen", "encapsulate", "decapsulate", "kem"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [[bench]]
 name = "mceliece"
 harness = false
 path = "benches/mceliece.rs"
+required-features = ["keygen", "encapsulate", "decapsulate"]

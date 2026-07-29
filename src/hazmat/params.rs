@@ -8,26 +8,33 @@
 //! implementations that bake one parameter set into the whole crate through cargo features,
 //! all enabled parameter sets here coexist and can be used side by side.
 
+#[cfg(any(feature = "keygen", feature = "decapsulate"))]
 use super::field::Field;
-#[cfg(any(feature = "mceliece348864", feature = "mceliece348864f"))]
+#[cfg(all(
+    any(feature = "keygen", feature = "decapsulate"),
+    any(feature = "mceliece348864", feature = "mceliece348864f")
+))]
 use super::field::Gf12;
-#[cfg(any(
-    feature = "mceliece460896",
-    feature = "mceliece460896f",
-    feature = "mceliece460896pc",
-    feature = "mceliece460896pcf",
-    feature = "mceliece6688128",
-    feature = "mceliece6688128f",
-    feature = "mceliece6688128pc",
-    feature = "mceliece6688128pcf",
-    feature = "mceliece6960119",
-    feature = "mceliece6960119f",
-    feature = "mceliece6960119pc",
-    feature = "mceliece6960119pcf",
-    feature = "mceliece8192128",
-    feature = "mceliece8192128f",
-    feature = "mceliece8192128pc",
-    feature = "mceliece8192128pcf"
+#[cfg(all(
+    any(feature = "keygen", feature = "decapsulate"),
+    any(
+        feature = "mceliece460896",
+        feature = "mceliece460896f",
+        feature = "mceliece460896pc",
+        feature = "mceliece460896pcf",
+        feature = "mceliece6688128",
+        feature = "mceliece6688128f",
+        feature = "mceliece6688128pc",
+        feature = "mceliece6688128pcf",
+        feature = "mceliece6960119",
+        feature = "mceliece6960119f",
+        feature = "mceliece6960119pc",
+        feature = "mceliece6960119pcf",
+        feature = "mceliece8192128",
+        feature = "mceliece8192128f",
+        feature = "mceliece8192128pc",
+        feature = "mceliece8192128pcf"
+    )
 ))]
 use super::field::Gf13;
 
@@ -42,8 +49,11 @@ pub struct Standards {
 
 /// A single reduction tap of the field polynomial `F(y)`.
 ///
+/// Only present when an operation that does field arithmetic is enabled.
+///
 /// `F(y) = y^t + sum(coeff_i * y^(exponent_i))`, so reducing a term `y^(t+d)` folds the
 /// coefficient into position `d + exponent`, scaled by `coeff`.
+#[cfg(feature = "keygen")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolyTap {
     /// The exponent of `y` this tap contributes to.
@@ -53,6 +63,7 @@ pub struct PolyTap {
     pub coeff: u16,
 }
 
+#[cfg(feature = "keygen")]
 impl PolyTap {
     /// A tap with coefficient one.
     const fn one(exponent: usize) -> Self {
@@ -68,7 +79,15 @@ pub trait Params:
     Copy + Clone + core::fmt::Debug + Default + Eq + Ord + core::hash::Hash + Send + Sync + 'static
 {
     /// The field `F_q = F_2[z]/f(z)` used by this parameter set.
+    ///
+    /// Only present when an operation that does field arithmetic is enabled. Encapsulation
+    /// needs the field's size but never its arithmetic, so an encapsulate-only build drops
+    /// the whole arithmetic layer.
+    #[cfg(any(feature = "keygen", feature = "decapsulate"))]
     type Field: Field;
+
+    /// The extension degree `m`, so that `q = 2^m`.
+    const M: usize;
 
     /// The lowercase parameter set name, e.g. `mceliece6960119f`.
     const NAME: &'static str;
@@ -89,6 +108,9 @@ pub trait Params:
     const PC: bool;
 
     /// The nonzero low-order taps of the field polynomial `F(y)` of degree `t`.
+    ///
+    /// Only `Irreducible` works in `F_q[y]/F(y)`, so this is only present with `keygen`.
+    #[cfg(feature = "keygen")]
     const POLY_TAPS: &'static [PolyTap];
 
     /// The NIST security category claimed for this parameter set.
@@ -97,11 +119,14 @@ pub trait Params:
     /// The standards this parameter set appears in.
     const STANDARDS: Standards;
 
-    /// The extension degree `m`, so that `q = 2^m`.
-    const M: usize = Self::Field::BITS;
-
     /// The field size `q = 2^m`.
     const Q: usize = 1 << Self::M;
+
+    /// A mask covering the `m` low bits of a field element.
+    ///
+    /// Only `FixedWeight` reduces raw randomness into the field this way.
+    #[cfg(feature = "encapsulate")]
+    const GFMASK: u16 = ((1u32 << Self::M) - 1) as u16;
 
     /// The code dimension `k = n - mt`.
     const K: usize = Self::N - Self::M * Self::T;
@@ -157,6 +182,7 @@ pub trait Params:
     /// The number of candidate indices drawn per `FixedWeight` attempt.
     ///
     /// The specification defines `tau` as `t` when `n = q`, `2t` when `q/2 <= n < q`, and so on.
+    #[cfg(feature = "encapsulate")]
     const TAU: usize = if Self::N == Self::Q {
         Self::T
     } else {
@@ -164,17 +190,29 @@ pub trait Params:
     };
 
     /// Whether the parameter set uses semi-systematic matrix reduction.
+    ///
+    /// Only key generation consults this, so it is only present with the `keygen` feature.
+    #[cfg(feature = "keygen")]
     const SEMI_SYSTEMATIC: bool = Self::NU > Self::MU;
 
     /// Whether ciphertexts carry padding bits that must be checked on input.
+    ///
+    /// Only decapsulation consults this, so it is only present with the `decapsulate` feature.
+    #[cfg(feature = "decapsulate")]
     const CIPHERTEXT_HAS_PADDING: bool = Self::PK_NROWS % 8 != 0;
 
     /// Whether public keys carry padding bits that must be checked on input.
+    ///
+    /// Only encapsulation validates an incoming public key.
+    #[cfg(feature = "encapsulate")]
     const PUBLIC_KEY_HAS_PADDING: bool = Self::PK_NCOLS % 8 != 0;
 }
 
 /// `F(y) = y^64 + y^3 + y + z` for `mceliece348864`.
-#[cfg(any(feature = "mceliece348864", feature = "mceliece348864f"))]
+#[cfg(all(
+    feature = "keygen",
+    any(feature = "mceliece348864", feature = "mceliece348864f")
+))]
 const TAPS_348864: &[PolyTap] = &[
     PolyTap::one(3),
     PolyTap::one(1),
@@ -185,11 +223,14 @@ const TAPS_348864: &[PolyTap] = &[
 ];
 
 /// `F(y) = y^96 + y^10 + y^9 + y^6 + 1` for `mceliece460896`.
-#[cfg(any(
-    feature = "mceliece460896",
-    feature = "mceliece460896f",
-    feature = "mceliece460896pc",
-    feature = "mceliece460896pcf"
+#[cfg(all(
+    feature = "keygen",
+    any(
+        feature = "mceliece460896",
+        feature = "mceliece460896f",
+        feature = "mceliece460896pc",
+        feature = "mceliece460896pcf"
+    )
 ))]
 const TAPS_460896: &[PolyTap] = &[
     PolyTap::one(10),
@@ -199,24 +240,30 @@ const TAPS_460896: &[PolyTap] = &[
 ];
 
 /// `F(y) = y^119 + y^8 + 1` for `mceliece6960119`.
-#[cfg(any(
-    feature = "mceliece6960119",
-    feature = "mceliece6960119f",
-    feature = "mceliece6960119pc",
-    feature = "mceliece6960119pcf"
+#[cfg(all(
+    feature = "keygen",
+    any(
+        feature = "mceliece6960119",
+        feature = "mceliece6960119f",
+        feature = "mceliece6960119pc",
+        feature = "mceliece6960119pcf"
+    )
 ))]
 const TAPS_6960119: &[PolyTap] = &[PolyTap::one(8), PolyTap::one(0)];
 
 /// `F(y) = y^128 + y^7 + y^2 + y + 1` for `mceliece6688128` and `mceliece8192128`.
-#[cfg(any(
-    feature = "mceliece6688128",
-    feature = "mceliece6688128f",
-    feature = "mceliece6688128pc",
-    feature = "mceliece6688128pcf",
-    feature = "mceliece8192128",
-    feature = "mceliece8192128f",
-    feature = "mceliece8192128pc",
-    feature = "mceliece8192128pcf"
+#[cfg(all(
+    feature = "keygen",
+    any(
+        feature = "mceliece6688128",
+        feature = "mceliece6688128f",
+        feature = "mceliece6688128pc",
+        feature = "mceliece6688128pcf",
+        feature = "mceliece8192128",
+        feature = "mceliece8192128f",
+        feature = "mceliece8192128pc",
+        feature = "mceliece8192128pcf"
+    )
 ))]
 const TAPS_128: &[PolyTap] = &[
     PolyTap::one(7),
@@ -231,6 +278,7 @@ macro_rules! define_params {
             $(#[$meta:meta])*
             $feature:literal => $name:ident {
                 field: $field:ty,
+                m: $m:expr,
                 n: $n:expr,
                 t: $t:expr,
                 taps: $taps:expr,
@@ -250,13 +298,16 @@ macro_rules! define_params {
 
             #[cfg(feature = $feature)]
             impl Params for $name {
+                #[cfg(any(feature = "keygen", feature = "decapsulate"))]
                 type Field = $field;
+                const M: usize = $m;
                 const NAME: &'static str = $feature;
                 const N: usize = $n;
                 const T: usize = $t;
                 const MU: usize = if $semi { 32 } else { 0 };
                 const NU: usize = if $semi { 64 } else { 0 };
                 const PC: bool = $pc;
+                #[cfg(feature = "keygen")]
                 const POLY_TAPS: &'static [PolyTap] = $taps;
                 const CLAIMED_NIST_LEVEL: usize = $level;
                 const STANDARDS: Standards = Standards { nist: $nist, iso: $iso };
@@ -268,97 +319,103 @@ macro_rules! define_params {
 define_params! {
     /// `mceliece348864`: `m = 12`, `n = 3488`, `t = 64`. NIST category 1. Not in the ISO standard.
     "mceliece348864" => McEliece348864 {
-        field: Gf12, n: 3488, t: 64, taps: TAPS_348864, level: 1,
+        field: Gf12, m: 12, n: 3488, t: 64, taps: TAPS_348864, level: 1,
         semi_systematic: false, pc: false, nist: true, iso: false,
     }
     /// `mceliece348864f`: `mceliece348864` with semi-systematic key generation.
     "mceliece348864f" => McEliece348864f {
-        field: Gf12, n: 3488, t: 64, taps: TAPS_348864, level: 1,
+        field: Gf12, m: 12, n: 3488, t: 64, taps: TAPS_348864, level: 1,
         semi_systematic: true, pc: false, nist: true, iso: false,
     }
     /// `mceliece460896`: `m = 13`, `n = 4608`, `t = 96`. NIST category 3.
     "mceliece460896" => McEliece460896 {
-        field: Gf13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
+        field: Gf13, m: 13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
         semi_systematic: false, pc: false, nist: true, iso: true,
     }
     /// `mceliece460896f`: `mceliece460896` with semi-systematic key generation.
     "mceliece460896f" => McEliece460896f {
-        field: Gf13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
+        field: Gf13, m: 13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
         semi_systematic: true, pc: false, nist: true, iso: true,
     }
     /// `mceliece460896pc`: `mceliece460896` with plaintext confirmation. ISO only.
     "mceliece460896pc" => McEliece460896pc {
-        field: Gf13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
+        field: Gf13, m: 13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
         semi_systematic: false, pc: true, nist: false, iso: true,
     }
     /// `mceliece460896pcf`: plaintext confirmation and semi-systematic key generation. ISO only.
     "mceliece460896pcf" => McEliece460896pcf {
-        field: Gf13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
+        field: Gf13, m: 13, n: 4608, t: 96, taps: TAPS_460896, level: 3,
         semi_systematic: true, pc: true, nist: false, iso: true,
     }
     /// `mceliece6688128`: `m = 13`, `n = 6688`, `t = 128`. NIST category 5.
     "mceliece6688128" => McEliece6688128 {
-        field: Gf13, n: 6688, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 6688, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: false, pc: false, nist: true, iso: true,
     }
     /// `mceliece6688128f`: `mceliece6688128` with semi-systematic key generation.
     "mceliece6688128f" => McEliece6688128f {
-        field: Gf13, n: 6688, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 6688, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: true, pc: false, nist: true, iso: true,
     }
     /// `mceliece6688128pc`: `mceliece6688128` with plaintext confirmation. ISO only.
     "mceliece6688128pc" => McEliece6688128pc {
-        field: Gf13, n: 6688, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 6688, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: false, pc: true, nist: false, iso: true,
     }
     /// `mceliece6688128pcf`: plaintext confirmation and semi-systematic key generation. ISO only.
     "mceliece6688128pcf" => McEliece6688128pcf {
-        field: Gf13, n: 6688, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 6688, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: true, pc: true, nist: false, iso: true,
     }
     /// `mceliece6960119`: `m = 13`, `n = 6960`, `t = 119`. NIST category 5.
     "mceliece6960119" => McEliece6960119 {
-        field: Gf13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
+        field: Gf13, m: 13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
         semi_systematic: false, pc: false, nist: true, iso: true,
     }
     /// `mceliece6960119f`: `mceliece6960119` with semi-systematic key generation.
     "mceliece6960119f" => McEliece6960119f {
-        field: Gf13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
+        field: Gf13, m: 13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
         semi_systematic: true, pc: false, nist: true, iso: true,
     }
     /// `mceliece6960119pc`: `mceliece6960119` with plaintext confirmation. ISO only.
     "mceliece6960119pc" => McEliece6960119pc {
-        field: Gf13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
+        field: Gf13, m: 13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
         semi_systematic: false, pc: true, nist: false, iso: true,
     }
     /// `mceliece6960119pcf`: plaintext confirmation and semi-systematic key generation. ISO only.
     "mceliece6960119pcf" => McEliece6960119pcf {
-        field: Gf13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
+        field: Gf13, m: 13, n: 6960, t: 119, taps: TAPS_6960119, level: 5,
         semi_systematic: true, pc: true, nist: false, iso: true,
     }
     /// `mceliece8192128`: `m = 13`, `n = 8192`, `t = 128`. NIST category 5.
     "mceliece8192128" => McEliece8192128 {
-        field: Gf13, n: 8192, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 8192, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: false, pc: false, nist: true, iso: true,
     }
     /// `mceliece8192128f`: `mceliece8192128` with semi-systematic key generation.
     "mceliece8192128f" => McEliece8192128f {
-        field: Gf13, n: 8192, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 8192, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: true, pc: false, nist: true, iso: true,
     }
     /// `mceliece8192128pc`: `mceliece8192128` with plaintext confirmation. ISO only.
     "mceliece8192128pc" => McEliece8192128pc {
-        field: Gf13, n: 8192, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 8192, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: false, pc: true, nist: false, iso: true,
     }
     /// `mceliece8192128pcf`: plaintext confirmation and semi-systematic key generation. ISO only.
     "mceliece8192128pcf" => McEliece8192128pcf {
-        field: Gf13, n: 8192, t: 128, taps: TAPS_128, level: 5,
+        field: Gf13, m: 13, n: 8192, t: 128, taps: TAPS_128, level: 5,
         semi_systematic: true, pc: true, nist: false, iso: true,
     }
 }
 
-#[cfg(test)]
+// The size table checks constants owned by all three operations.
+#[cfg(all(
+    test,
+    feature = "keygen",
+    feature = "encapsulate",
+    feature = "decapsulate"
+))]
 mod tests {
     use super::*;
 

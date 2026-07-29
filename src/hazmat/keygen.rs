@@ -6,7 +6,6 @@
 
 use shake::digest::{ExtendableOutput, Update};
 
-use super::benes::support_gen;
 use super::controlbits::control_bits_from_permutation;
 use super::field::Field;
 use super::matrix::BitMatrix;
@@ -316,23 +315,7 @@ pub(crate) fn public_key_from_secret_key<P: Params>(sk: &[u8], pk: &mut [u8]) {
     regenerated.zeroize();
 }
 
-/// Recover the support `alpha` and Goppa polynomial `g` from a private key.
-///
-/// `support` receives `n` elements and `goppa` receives `t + 1` coefficients with a leading 1.
-pub(crate) fn load_private_key<P: Params>(sk: &[u8], goppa: &mut [u16], support: &mut [u16]) {
-    debug_assert_eq!(goppa.len(), P::T + 1);
-    debug_assert_eq!(support.len(), P::N);
-
-    for (i, slot) in goppa.iter_mut().take(P::T).enumerate() {
-        let at = P::IRR_OFFSET + i * 2;
-        *slot = u16::from_le_bytes([sk[at], sk[at + 1]]) & P::Field::MASK;
-    }
-    goppa[P::T] = 1;
-
-    support_gen::<P>(support, &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES]);
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "decapsulate"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
@@ -396,7 +379,7 @@ mod tests {
         // the support elements are distinct and none of them is a root of `g`.
         let mut goppa = vec![0u16; P::T + 1];
         let mut support = vec![0u16; P::N];
-        load_private_key::<P>(&sk, &mut goppa, &mut support);
+        crate::hazmat::decap::load_private_key::<P>(&sk, &mut goppa, &mut support);
 
         let mut seen = vec![false; P::Q];
         for &a in support.iter() {

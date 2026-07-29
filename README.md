@@ -73,16 +73,34 @@ Shared secrets are 32 bytes everywhere.
 
 ## Features
 
+Parameter sets and operations are selected independently.
+
 | feature | effect |
 | ------- | ------ |
 | `nist` | the ten parameter sets in the NIST round-4 submission |
 | `iso` | the sixteen parameter sets in the ISO standard |
 | `pc` | the eight plaintext-confirmation parameter sets |
 | `mceliece...` | one parameter set each, for building only what you use |
+| `keygen` | `KeyGen` and `SeededKeyGen` |
+| `encapsulate` | `Encap` |
+| `decapsulate` | `Decap` |
+| `kem` | the [`kem`](https://docs.rs/kem) crate traits; implies all three operations |
 | `serde` | serialization for every value type |
 | `hazmat` | makes the low-level, parameter-set-typed layer public |
 
-`default = ["nist", "iso", "serde"]`.
+`default = ["nist", "iso", "serde", "keygen", "encapsulate", "decapsulate", "kem"]`.
+
+At least one operation must be enabled. A build only carries the code and dependencies its
+enabled operations reach, which matters most for constrained targets:
+
+- **Encapsulate-only** — a client encrypting to a server's public key. `Encode` is pure bit
+  manipulation, so this build has no field arithmetic, no polynomial arithmetic, no matrix
+  reduction, no sorting networks and no Beneš network.
+- **Decapsulate-only** — a server unwrapping with a provisioned key. Drops `rand_core`
+  entirely, since decapsulation consumes no randomness.
+
+Dropping the `kem` feature also drops `hybrid-array`'s `extra-sizes`, which is what generates
+the type-level constants up to `U1357824`, so it is a noticeable compile-time saving.
 
 ## Performance
 

@@ -13,19 +13,29 @@
 use core::marker::PhantomData;
 
 use ctutils::{Choice, CtEq};
+#[cfg(any(feature = "keygen", feature = "encapsulate"))]
 use rand_core::CryptoRng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[cfg(feature = "decapsulate")]
 use super::decap::{ciphertext_padding_is_zero, decapsulate};
+#[cfg(feature = "encapsulate")]
 use super::encap::{encapsulate, public_key_padding_is_zero};
+#[cfg(feature = "keygen")]
 use super::keygen::{public_key_from_secret_key, seeded_keypair};
 use super::params::Params;
-use crate::{Error, McElieceResult};
+#[cfg_attr(
+    not(any(feature = "keygen", feature = "encapsulate", feature = "decapsulate")),
+    allow(unused_imports)
+)]
+use crate::Error;
+use crate::McElieceResult;
 
 macro_rules! byte_value {
     (
         $(#[$meta:meta])*
-        $name:ident, $length:ident, $error:ident, secret = $secret:literal
+        $name:ident, $length:ident, $error:ident,
+        secret = $secret:literal, constructed_when = $constructed:meta
     ) => {
         $(#[$meta])*
         #[derive(Clone)]
@@ -40,7 +50,7 @@ macro_rules! byte_value {
 
             /// Parse a value from bytes, checking the length.
             pub fn from_slice(bytes: &[u8]) -> McElieceResult<Self> {
-                if bytes.len() != P::$length {
+                if bytes.len() != Self::LENGTH {
                     return Err(Error::$error(bytes.len()));
                 }
                 Ok(Self {
@@ -57,6 +67,7 @@ macro_rules! byte_value {
                 core::mem::take(&mut self.bytes)
             }
 
+            #[cfg($constructed)]
             pub(crate) fn zeroed() -> Self {
                 Self {
                     bytes: vec![0u8; P::$length],
@@ -101,22 +112,22 @@ macro_rules! byte_value {
 
 byte_value! {
     /// A Classic McEliece encapsulation (public) key, the matrix `T`.
-    EncapsulationKey, PUBLIC_KEY_LENGTH, InvalidEncapsulationKeyLength, secret = false
+    EncapsulationKey, PUBLIC_KEY_LENGTH, InvalidEncapsulationKeyLength, secret = false, constructed_when = any(feature = "keygen")
 }
 
 byte_value! {
     /// A Classic McEliece decapsulation (private) key, `(delta, c, g, alpha, s)`.
-    DecapsulationKey, SECRET_KEY_LENGTH, InvalidDecapsulationKeyLength, secret = true
+    DecapsulationKey, SECRET_KEY_LENGTH, InvalidDecapsulationKeyLength, secret = true, constructed_when = any(feature = "keygen")
 }
 
 byte_value! {
     /// A Classic McEliece ciphertext.
-    Ciphertext, CIPHERTEXT_LENGTH, InvalidCiphertextLength, secret = false
+    Ciphertext, CIPHERTEXT_LENGTH, InvalidCiphertextLength, secret = false, constructed_when = any(feature = "encapsulate")
 }
 
 byte_value! {
     /// A Classic McEliece shared secret.
-    SharedSecret, SHARED_SECRET_LENGTH, InvalidSharedSecretLength, secret = true
+    SharedSecret, SHARED_SECRET_LENGTH, InvalidSharedSecretLength, secret = true, constructed_when = any(feature = "encapsulate", feature = "decapsulate")
 }
 
 macro_rules! zeroize_on_drop {
@@ -140,6 +151,7 @@ macro_rules! zeroize_on_drop {
 zeroize_on_drop!(DecapsulationKey);
 zeroize_on_drop!(SharedSecret);
 
+#[cfg(feature = "encapsulate")]
 impl<P: Params> EncapsulationKey<P> {
     /// Whether every padding bit is zero.
     ///
@@ -150,16 +162,27 @@ impl<P: Params> EncapsulationKey<P> {
     }
 }
 
+/// The seed `delta` stored at the front of a private key.
+///
+/// Shared by the typed and dynamic APIs so that the layout is described in exactly one place.
+pub(crate) fn seed_of<P: Params>(private_key: &[u8]) -> &[u8] {
+    &private_key[..P::SEED_LENGTH]
+}
+
+// The dynamic API reads the seed through `seed_of`, so this accessor only exists where the
+// typed value itself is reachable.
+#[cfg(feature = "hazmat")]
 impl<P: Params> DecapsulationKey<P> {
     /// The 32-byte seed `delta` this key was generated from.
     ///
     /// Knowing `delta` is equivalent to knowing the whole private key, so treat it with the
     /// same care.
     pub fn seed(&self) -> &[u8] {
-        &self.bytes[..P::SEED_LENGTH]
+        seed_of::<P>(&self.bytes)
     }
 }
 
+#[cfg(feature = "keygen")]
 impl<P: Params> From<&DecapsulationKey<P>> for EncapsulationKey<P> {
     /// Recover the encapsulation key by rerunning key generation from the stored seed.
     ///
@@ -172,6 +195,7 @@ impl<P: Params> From<&DecapsulationKey<P>> for EncapsulationKey<P> {
     }
 }
 
+#[cfg(feature = "decapsulate")]
 impl<P: Params> Ciphertext<P> {
     /// Whether every padding bit is zero.
     ///
@@ -188,10 +212,13 @@ impl<P: Params> Ciphertext<P> {
 pub trait Kem: Params {
     /// `SeededKeyGen`: derive a key pair deterministically from a 32-byte seed.
     ///
+    /// Requires the `keygen` feature.
+    ///
     /// The same seed always yields the same key pair, which makes key generation reproducible
     /// for testing and for deriving a long-term key from an existing secret. The seed must be
     /// generated with a cryptographically secure source; it is exactly as sensitive as the
     /// private key.
+    #[cfg(feature = "keygen")]
     fn generate_keypair_from_seed(
         seed: &[u8],
     ) -> McElieceResult<(EncapsulationKey<Self>, DecapsulationKey<Self>)> {
@@ -210,6 +237,9 @@ pub trait Kem: Params {
     }
 
     /// `KeyGen`: draw a fresh seed from `rng` and generate a key pair from it.
+    ///
+    /// Requires the `keygen` feature.
+    #[cfg(feature = "keygen")]
     fn generate_keypair(
         mut rng: impl CryptoRng,
     ) -> (EncapsulationKey<Self>, DecapsulationKey<Self>) {
@@ -227,6 +257,9 @@ pub trait Kem: Params {
     /// `Encap`: produce a ciphertext and the shared secret it transports.
     ///
     /// Returns [`Error::EncapsulationKeyPadding`] when `key` has nonzero padding bits.
+    ///
+    /// Requires the `encapsulate` feature.
+    #[cfg(feature = "encapsulate")]
     fn encapsulate(
         key: &EncapsulationKey<Self>,
         rng: impl CryptoRng,
@@ -250,6 +283,9 @@ pub trait Kem: Params {
     ///
     /// The one condition that is reported is [`Error::CiphertextPadding`], which depends only
     /// on public data.
+    ///
+    /// Requires the `decapsulate` feature.
+    #[cfg(feature = "decapsulate")]
     fn decapsulate(
         key: &DecapsulationKey<Self>,
         ciphertext: &Ciphertext<Self>,
@@ -264,7 +300,12 @@ pub trait Kem: Params {
 
 impl<P: Params> Kem for P {}
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "keygen",
+    feature = "encapsulate",
+    feature = "decapsulate"
+))]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
