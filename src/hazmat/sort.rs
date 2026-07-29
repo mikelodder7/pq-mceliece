@@ -47,18 +47,33 @@ macro_rules! sorter {
 
             let mut p = top;
             while p > 0 {
-                for i in 0..n - p {
-                    if i & p == 0 {
-                        let (lo, hi) = $minmax(x[i], x[i + p]);
-                        x[i] = lo;
-                        x[i + p] = hi;
+                // The indices this stage touches are those with one particular bit clear, and
+                // since the stride is a power of two they come in contiguous runs. Walking the
+                // runs, rather than testing every index, leaves the inner loop branch free and
+                // over two provably disjoint slices, which is what lets it vectorize.
+                let mut base = 0;
+                while base < n - p {
+                    let run = p.min(n - p - base);
+                    let (left, right) = x[base..base + p + run].split_at_mut(p);
+                    for (a, b) in left[..run].iter_mut().zip(right[..run].iter_mut()) {
+                        let (lo, hi) = $minmax(*a, *b);
+                        *a = lo;
+                        *b = hi;
                     }
+                    base += p * 2;
                 }
 
+                // This stage carries a value down a chain of strides for each index. The
+                // chain stays in a register, which is why the loops are not swapped here:
+                // hoisting the chain outward and sweeping runs vectorizes the inner step but
+                // spills the carried value to memory, and measured slower at every width
+                // tried.
                 let mut q = top;
                 while q > p {
-                    for i in 0..n - q {
-                        if i & p == 0 {
+                    let mut base = 0;
+                    while base < n - q {
+                        let run = p.min(n - q - base);
+                        for i in base..base + run {
                             let mut a = x[i + p];
                             let mut r = q;
                             while r > p {
@@ -69,6 +84,7 @@ macro_rules! sorter {
                             }
                             x[i + p] = a;
                         }
+                        base += p * 2;
                     }
                     q >>= 1;
                 }
