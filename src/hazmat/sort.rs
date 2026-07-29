@@ -9,27 +9,31 @@
 //! length, and each comparison is a branch-free conditional exchange.
 
 /// Order a pair of signed integers without branching.
+///
+/// Widening to 64 bits first means the difference cannot overflow, so its sign bit answers the
+/// comparison directly and the rest is a masked select. That is shorter and has a far tighter
+/// dependency chain than doing the same with 32-bit borrow propagation, and it stays branchless
+/// by construction rather than relying on the compiler to choose a conditional move.
 #[inline]
 const fn minmax_i32(a: i32, b: i32) -> (i32, i32) {
-    let ab = b ^ a;
-    // Borrow-propagating subtraction; the sign bit of `c` ends up set exactly when `a > b`.
-    let mut c = (!b & a) | ((!b | a) & b.wrapping_sub(a));
-    c ^= ab & (c ^ b);
-    c >>= 31;
-    c &= ab;
-    (a ^ c, b ^ c)
+    let mask = (((a as i64) - (b as i64)) >> 63) as i32;
+    ((a & mask) | (b & !mask), (a & !mask) | (b & mask))
 }
 
 /// Order a pair of unsigned integers without branching.
 ///
-/// The unsigned case cannot use a plain subtraction sign test, so it uses the overflow
-/// detection identity from *Hacker's Delight* section 2-13.
+/// Same idea as the signed case: widening past the operands' width makes the difference exact,
+/// so its sign bit is the comparison.
 #[inline]
 const fn minmax_u64(a: u64, b: u64) -> (u64, u64) {
-    let d = (!b & a) | ((!b | a) & b.wrapping_sub(a));
-    let c = 0u64.wrapping_sub(d >> 63) & (a ^ b);
-    (a ^ c, b ^ c)
+    let mask = (((a as i128) - (b as i128)) >> 127) as u64;
+    ((a & mask) | (b & !mask), (a & !mask) | (b & mask))
 }
+
+/// How many independent chains the strided stage advances together.
+///
+/// Four measured fastest; two is close, and eight or more starts spilling.
+const CHAIN_WIDTH: usize = 4;
 
 macro_rules! sorter {
     ($(#[$meta:meta])* $name:ident, $ty:ty, $minmax:ident) => {
@@ -68,12 +72,38 @@ macro_rules! sorter {
                 // hoisting the chain outward and sweeping runs vectorizes the inner step but
                 // spills the carried value to memory, and measured slower at every width
                 // tried.
+                // This stage carries a value down a chain of strides. The chain is serial, but
+                // neighbouring indices are independent, so a fixed number of them advance
+                // together. The width has to be a compile-time constant: with a runtime length
+                // the carried values spill to memory and the whole gain disappears.
                 let mut q = top;
                 while q > p {
                     let mut base = 0;
                     while base < n - q {
                         let run = p.min(n - q - base);
-                        for i in base..base + run {
+
+                        let mut offset = 0;
+                        while offset + CHAIN_WIDTH <= run {
+                            let i = base + offset;
+                            let mut carry = [<$ty>::default(); CHAIN_WIDTH];
+                            carry.copy_from_slice(&x[i + p..i + p + CHAIN_WIDTH]);
+
+                            let mut r = q;
+                            while r > p {
+                                let window = &mut x[i + r..i + r + CHAIN_WIDTH];
+                                for (a, b) in carry.iter_mut().zip(window.iter_mut()) {
+                                    let (lo, hi) = $minmax(*a, *b);
+                                    *a = lo;
+                                    *b = hi;
+                                }
+                                r >>= 1;
+                            }
+
+                            x[i + p..i + p + CHAIN_WIDTH].copy_from_slice(&carry);
+                            offset += CHAIN_WIDTH;
+                        }
+
+                        for i in base + offset..base + run {
                             let mut a = x[i + p];
                             let mut r = q;
                             while r > p {
@@ -84,6 +114,7 @@ macro_rules! sorter {
                             }
                             x[i + p] = a;
                         }
+
                         base += p * 2;
                     }
                     q >>= 1;
