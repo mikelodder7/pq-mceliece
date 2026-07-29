@@ -41,9 +41,11 @@ mod params;
 mod benes;
 #[cfg(feature = "keygen")]
 mod controlbits;
+#[cfg(feature = "decapsulate")]
+mod fft;
 #[cfg(feature = "keygen")]
 mod matrix;
-#[cfg(any(feature = "keygen", feature = "decapsulate"))]
+#[cfg(feature = "keygen")]
 mod poly;
 #[cfg(feature = "keygen")]
 mod sort;

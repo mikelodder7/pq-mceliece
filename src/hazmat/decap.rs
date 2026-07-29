@@ -4,90 +4,86 @@
 */
 //! Decapsulation: syndrome computation, Berlekamp-Massey decoding and implicit rejection.
 
-use super::benes::support_gen;
+use super::benes::apply_benes;
+use super::fft::eval_all_bitrev;
 use super::field::{Field, add, is_zero_mask};
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, HASH_REJECTION, hash_32};
 use super::params::Params;
-use super::poly::{EVAL_LANES, eval_many};
 
-/// Recover the support `alpha` and Goppa polynomial `g` from a private key.
+/// How many field elements to advance through the syndrome series at once.
 ///
-/// `support` receives `n` elements and `goppa` receives `t + 1` coefficients with a leading 1.
-pub(crate) fn load_private_key<P: Params>(sk: &[u8], goppa: &mut [u16], support: &mut [u16]) {
+/// Each element's series is a serial chain of multiplications, so running one element at a time
+/// would sit at the latency of the field multiplier rather than its throughput. Eight is enough
+/// to cover the latency of both the carry-less-multiply and the portable multiplier without
+/// running out of registers.
+const SERIES_LANES: usize = 8;
+
+/// Read the Goppa polynomial from a private key, appending its implicit leading one.
+pub(crate) fn load_goppa<P: Params>(sk: &[u8], goppa: &mut [u16]) {
     debug_assert_eq!(goppa.len(), P::T + 1);
-    debug_assert_eq!(support.len(), P::N);
 
     for (i, slot) in goppa.iter_mut().take(P::T).enumerate() {
         let at = P::IRR_OFFSET + i * 2;
         *slot = u16::from_le_bytes([sk[at], sk[at + 1]]) & P::Field::MASK;
     }
     goppa[P::T] = 1;
-
-    support_gen::<P>(support, &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES]);
 }
 
-/// The per-position weighting `1 / g(alpha_i)^2` shared by every syndrome of a given key.
-///
-/// Both the decode syndrome and the re-encryption syndrome scale each position by exactly this,
-/// and it depends only on the private key, so it is computed once per decapsulation rather than
-/// once per syndrome.
-fn scaling<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16]) {
-    debug_assert_eq!(out.len(), support.len());
+/// The control bits encoding the field ordering.
+fn control_bits<P: Params>(sk: &[u8]) -> &[u8] {
+    &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES]
+}
 
-    eval_many::<P>(out, goppa, support);
+/// The position weighting `1 / g(alpha)^2` for every field element, in bit-reversed order.
+///
+/// `g` is irreducible of degree at least two, so it has no root anywhere in `F_q` and every
+/// inverse below is well defined.
+fn scaling<P: Params>(out: &mut [u16], goppa: &[u16]) {
+    debug_assert_eq!(out.len(), P::Q);
+
+    eval_all_bitrev::<P>(out, goppa);
     for slot in out.iter_mut() {
         *slot = P::Field::inv(P::Field::sq(*slot));
     }
 }
 
-/// Compute the length-`2t` syndrome of the received word `r` for the Goppa code `(g, alpha)`.
+/// Compute the length-`2t` syndrome from a bit-reversed-order received word.
 ///
-/// Entry `j` is `sum_i r_i / g(alpha_i)^2 * alpha_i^j`, the standard Goppa syndrome in the
-/// alternant form the decoder expects. `scale` holds the `1 / g(alpha_i)^2` factors from
-/// [`scaling`].
-fn syndrome<P: Params>(out: &mut [u16], scale: &[u16], support: &[u16], r: &[u8]) {
+/// Entry `j` is `sum_k scale[k] * bits[k] * bitrev(k)^j`. Index `k` stands for the field
+/// element `bitrev(k)`, which is the ordering [`eval_all_bitrev`] produces and the ordering the
+/// Beneš network maps positions into.
+fn syndrome<P: Params>(out: &mut [u16], scale: &[u16], bits: &[u8]) {
     debug_assert_eq!(out.len(), 2 * P::T);
-    debug_assert_eq!(scale.len(), support.len());
+    debug_assert_eq!(scale.len(), P::Q);
 
     out.fill(0);
 
-    // Each position contributes the geometric series `w, w*a, w*a^2, ...`, which is a serial
-    // chain of multiplications. Positions are independent of one another, so several are
+    // Each element contributes the geometric series `w, w*a, w*a^2, ...`, which is a serial
+    // chain of multiplications. Elements are independent of one another, so several are
     // advanced in lockstep to keep the multiplier busy.
-    let mut points = support.chunks_exact(EVAL_LANES);
-    let mut chunk_index = 0;
-
-    for args in points.by_ref() {
-        let mut weight = [0u16; EVAL_LANES];
-        for (lane, w) in weight.iter_mut().enumerate() {
-            let i = chunk_index + lane;
-            // Folding the selection bit into the first term rather than into every term
-            // saves `2t` masking operations per position, and is equivalent because the
-            // whole series is scaled by it.
-            let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
-            *w = scale[i] & 0u16.wrapping_sub(bit);
+    let mut base = 0usize;
+    while base < P::Q {
+        let mut weight = [0u16; SERIES_LANES];
+        let mut point = [0u16; SERIES_LANES];
+        for (lane, (w, a)) in weight.iter_mut().zip(point.iter_mut()).enumerate() {
+            let k = base + lane;
+            // Folding the selection bit into the first term rather than into every term saves
+            // `2t` masking operations, and is equivalent because the whole series is scaled
+            // by it.
+            let bit = ((bits[k / 8] >> (k % 8)) & 1) as u16;
+            *w = scale[k] & 0u16.wrapping_sub(bit);
+            *a = P::Field::bitrev(k as u16);
         }
 
         for slot in out.iter_mut() {
             let mut acc = 0u16;
-            for (w, &a) in weight.iter_mut().zip(args.iter()) {
+            for (w, &a) in weight.iter_mut().zip(point.iter()) {
                 acc = add(acc, *w);
                 *w = P::Field::mul(*w, a);
             }
             *slot = add(*slot, acc);
         }
-        chunk_index += EVAL_LANES;
-    }
-
-    for (lane, &a) in points.remainder().iter().enumerate() {
-        let i = chunk_index + lane;
-        let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
-        let mut weight = scale[i] & 0u16.wrapping_sub(bit);
-
-        for slot in out.iter_mut() {
-            *slot = add(*slot, weight);
-            weight = P::Field::mul(weight, a);
-        }
+        base += SERIES_LANES;
     }
 }
 
@@ -156,51 +152,78 @@ fn berlekamp_massey<P: Params>(out: &mut [u16], syndrome: &[u16]) {
 /// rather than a `bool` keeps the caller's selection of `e` against the rejection string `s`
 /// free of any branch on secret data. On failure `e` holds an unspecified value that the
 /// caller must discard in favour of `s`.
-pub(crate) fn decode<P: Params>(e: &mut [u8], goppa: &[u16], support: &[u16], c0: &[u8]) -> u8 {
+///
+/// The work happens in field-element order rather than code-position order. Support element
+/// `alpha_i` is `bitrev` of the permutation image of position `i`, so moving the received word
+/// through the inverse Beneš network lines positions up against field elements without a single
+/// secret-dependent index. That is what lets the additive FFT evaluate the Goppa polynomial and
+/// the error locator at every element at once, instead of one support point at a time.
+pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     debug_assert_eq!(e.len(), P::N_BYTES);
     debug_assert_eq!(c0.len(), P::SYND_BYTES);
 
-    // Extend `C0` with `k` zeros to get a length-`n` received word.
-    let mut received = vec![0u8; P::N_BYTES];
-    received[..P::SYND_BYTES].copy_from_slice(c0);
+    let cond = control_bits::<P>(sk);
+    let plane = P::Q / 8;
 
-    // The position weighting depends only on the key, so both syndromes below share it.
-    let mut scale = vec![0u16; P::N];
-    scaling::<P>(&mut scale, goppa, support);
+    let mut goppa = vec![0u16; P::T + 1];
+    load_goppa::<P>(sk, &mut goppa);
+
+    // The received word: `C0` extended with zeros, then moved into field-element order.
+    let mut received = vec![0u8; plane];
+    received[..P::SYND_BYTES].copy_from_slice(c0);
+    apply_benes::<P>(&mut received, cond, true);
+
+    // Which field elements carry a real code position. Elements beyond the code length must
+    // not contribute to the re-encryption syndrome even if the locator happens to vanish there.
+    let mut valid = vec![0u8; plane];
+    valid[..P::N_BYTES].fill(0xFF);
+    apply_benes::<P>(&mut valid, cond, true);
+
+    // The weighting depends only on the key, so both syndromes below share it.
+    let mut scale = vec![0u16; P::Q];
+    scaling::<P>(&mut scale, &goppa);
 
     let mut s = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut s, &scale, support, &received);
+    syndrome::<P>(&mut s, &scale, &received);
 
     let mut locator = vec![0u16; P::T + 1];
     berlekamp_massey::<P>(&mut locator, &s);
 
-    let mut images = vec![0u16; P::N];
-    eval_many::<P>(&mut images, &locator, support);
+    let mut images = vec![0u16; P::Q];
+    eval_all_bitrev::<P>(&mut images, &locator);
 
-    e.fill(0);
+    let mut error = vec![0u8; plane];
     let mut weight = 0u16;
-    for (i, &image) in images.iter().enumerate() {
-        let is_root = is_zero_mask(image) & 1;
-        e[i / 8] |= (is_root as u8) << (i % 8);
-        weight += is_root;
+    for (k, &image) in images.iter().enumerate() {
+        let is_root = (is_zero_mask(image) & 1) as u8 & ((valid[k / 8] >> (k % 8)) & 1);
+        error[k / 8] |= is_root << (k % 8);
+        weight += is_root as u16;
     }
 
     // The decoder is only trusted when the recovered `e` has weight exactly `t` and reproduces
     // the syndrome, which is the `wt(e) = t and C = He` condition of the specification.
     let mut recomputed = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut recomputed, &scale, support, e);
+    syndrome::<P>(&mut recomputed, &scale, &error);
 
     let mut check = weight ^ (P::T as u16);
     for (a, b) in s.iter().zip(recomputed.iter()) {
         check |= a ^ b;
     }
 
+    // Back to code-position order.
+    apply_benes::<P>(&mut error, cond, false);
+    e.copy_from_slice(&error[..P::N_BYTES]);
+
     use zeroize::Zeroize;
+    goppa.zeroize();
+    received.zeroize();
+    valid.zeroize();
+    scale.zeroize();
     s.zeroize();
     recomputed.zeroize();
     locator.zeroize();
     images.zeroize();
-    scale.zeroize();
+    error.zeroize();
 
     // `check == 0` exactly when decoding succeeded.
     0u8.wrapping_sub((check.wrapping_sub(1) >> 15) as u8)
@@ -231,12 +254,8 @@ pub(crate) fn decapsulate<P: Params>(session_key: &mut [u8], ciphertext: &[u8], 
 
     let padding_ok = ciphertext_padding_is_zero::<P>(ciphertext);
 
-    let mut goppa = vec![0u16; P::T + 1];
-    let mut support = vec![0u16; P::N];
-    load_private_key::<P>(sk, &mut goppa, &mut support);
-
     let mut decoded = vec![0u8; P::N_BYTES];
-    let mut keep = decode::<P>(&mut decoded, &goppa, &support, &ciphertext[..P::SYND_BYTES]);
+    let mut keep = decode::<P>(&mut decoded, sk, &ciphertext[..P::SYND_BYTES]);
 
     // Implicit rejection: replace `e` with `s` when decoding failed.
     let rejection = &sk[P::S_OFFSET..P::S_OFFSET + P::N_BYTES];
@@ -268,8 +287,6 @@ pub(crate) fn decapsulate<P: Params>(session_key: &mut [u8], ciphertext: &[u8], 
     hash_32(HASH_ENCAPSULATION & keep, &e, ciphertext, session_key);
 
     use zeroize::Zeroize;
-    goppa.zeroize();
-    support.zeroize();
     decoded.zeroize();
     e.zeroize();
 
@@ -342,10 +359,6 @@ mod tests {
         let mut sk = vec![0u8; P::SECRET_KEY_LENGTH];
         seeded_keypair::<P>(&mut pk, &mut sk, &[seed; 32]);
 
-        let mut goppa = vec![0u16; P::T + 1];
-        let mut support = vec![0u16; P::N];
-        load_private_key::<P>(&sk, &mut goppa, &mut support);
-
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([seed ^ 0x11; 32]);
         let mut e = vec![0u8; P::N_BYTES];
         fixed_weight::<P>(&mut e, &mut rng);
@@ -354,7 +367,7 @@ mod tests {
         encode::<P>(&mut c0, &pk, &e);
 
         let mut recovered = vec![0u8; P::N_BYTES];
-        assert_eq!(decode::<P>(&mut recovered, &goppa, &support, &c0), 0xFF);
+        assert_eq!(decode::<P>(&mut recovered, &sk, &c0), 0xFF);
         assert_eq!(recovered, e, "{} decode", P::NAME);
     }
 
@@ -364,10 +377,6 @@ mod tests {
         let mut sk = vec![0u8; P::SECRET_KEY_LENGTH];
         seeded_keypair::<P>(&mut pk, &mut sk, &[seed; 32]);
 
-        let mut goppa = vec![0u16; P::T + 1];
-        let mut support = vec![0u16; P::N];
-        load_private_key::<P>(&sk, &mut goppa, &mut support);
-
         // All ones is not the syndrome of a weight-`t` vector for any of these codes.
         let mut c0 = vec![0xFFu8; P::SYND_BYTES];
         if P::CIPHERTEXT_HAS_PADDING {
@@ -375,7 +384,7 @@ mod tests {
         }
 
         let mut recovered = vec![0u8; P::N_BYTES];
-        assert_eq!(decode::<P>(&mut recovered, &goppa, &support, &c0), 0x00);
+        assert_eq!(decode::<P>(&mut recovered, &sk, &c0), 0x00);
     }
 
     macro_rules! decap_tests {

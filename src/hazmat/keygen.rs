@@ -379,7 +379,11 @@ mod tests {
         // the support elements are distinct and none of them is a root of `g`.
         let mut goppa = vec![0u16; P::T + 1];
         let mut support = vec![0u16; P::N];
-        crate::hazmat::decap::load_private_key::<P>(&sk, &mut goppa, &mut support);
+        crate::hazmat::decap::load_goppa::<P>(&sk, &mut goppa);
+        crate::hazmat::benes::support_gen::<P>(
+            &mut support,
+            &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES],
+        );
 
         let mut seen = vec![false; P::Q];
         for &a in support.iter() {

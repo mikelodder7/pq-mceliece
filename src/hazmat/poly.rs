@@ -118,6 +118,10 @@ pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool 
 /// Evaluate the monic degree-`t` polynomial `f` at `a`.
 ///
 /// `f` holds `t + 1` coefficients in ascending order, with `f[t] = 1` for a Goppa polynomial.
+///
+/// Only key generation evaluates one point at a time; decoding uses the additive FFT to reach
+/// every point at once.
+#[cfg(feature = "keygen")]
 #[inline]
 pub(crate) fn eval<P: Params>(f: &[u16], a: u16) -> u16 {
     let mut r = f[P::T];
@@ -136,6 +140,7 @@ pub(crate) fn eval<P: Params>(f: &[u16], a: u16) -> u16 {
 pub(crate) const EVAL_LANES: usize = 8;
 
 /// Evaluate `f` at every element of `support`, writing the results to `out`.
+#[cfg(feature = "keygen")]
 pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) {
     debug_assert_eq!(out.len(), support.len());
 
