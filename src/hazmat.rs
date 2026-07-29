@@ -51,6 +51,8 @@ mod poly;
 mod sort;
 #[cfg(feature = "decapsulate")]
 mod transpose;
+#[cfg(feature = "decapsulate")]
+mod vec;
 
 #[cfg(feature = "decapsulate")]
 mod decap;

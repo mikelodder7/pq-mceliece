@@ -83,6 +83,10 @@ pub trait Field:
 ///
 /// The `MASK` return value (rather than `1`) lets callers use the result directly as an
 /// `AND` mask for constant-time selection.
+///
+/// Decoding tests for zero by or-reducing bit-planes instead, so only key generation, which
+/// searches for a pivot, needs this.
+#[cfg(feature = "keygen")]
 #[inline]
 pub const fn is_zero_mask(a: Elem) -> Elem {
     // `a - 1` borrows into the high bits exactly when `a == 0`.
@@ -94,36 +98,6 @@ pub const fn is_zero_mask(a: Elem) -> Elem {
 #[inline]
 pub const fn add(a: Elem, b: Elem) -> Elem {
     a ^ b
-}
-
-/// Invert every element of `values` in place, using a single field inversion for the batch.
-///
-/// Montgomery's trick: accumulate the running product of everything before each position,
-/// invert the total once, then walk back down recovering each inverse and peeling its factor
-/// off the accumulator. That is about `3n` multiplications and one inversion, against `n`
-/// inversions of roughly a dozen multiplications each.
-///
-/// Every input must be nonzero, which is why this is usable for the Goppa position weighting:
-/// `g` is irreducible of degree at least two, so it has no root anywhere in `F_q`. A zero
-/// anywhere in the batch would silently zero the whole result rather than fail.
-///
-/// `prefix` is caller-supplied scratch of the same length as `values`.
-#[cfg(feature = "decapsulate")]
-pub(crate) fn batch_invert<F: Field>(values: &mut [u16], prefix: &mut [u16]) {
-    debug_assert_eq!(prefix.len(), values.len());
-
-    let mut running = 1u16;
-    for (slot, &value) in prefix.iter_mut().zip(values.iter()) {
-        *slot = running;
-        running = F::mul(running, value);
-    }
-
-    let mut accumulator = F::inv(running);
-    for i in (0..values.len()).rev() {
-        let value = values[i];
-        values[i] = F::mul(accumulator, prefix[i]);
-        accumulator = F::mul(accumulator, value);
-    }
 }
 
 /// Carry-less multiplication of two values of at most 13 bits.
@@ -518,44 +492,6 @@ mod tests {
         }
     }
 
-    /// Batch inversion must agree with inverting each element on its own.
-    fn batch_matches_individual_inverses<F: Field>(seed: u64) {
-        struct Rng(u64);
-        impl Rng {
-            fn next(&mut self) -> u64 {
-                self.0 ^= self.0 << 13;
-                self.0 ^= self.0 >> 7;
-                self.0 ^= self.0 << 17;
-                self.0
-            }
-        }
-
-        let mut rng = Rng(seed);
-        for &len in &[1usize, 2, 3, 17, 64, 1000] {
-            // Nonzero inputs only, which is the precondition.
-            let values: Vec<u16> = (0..len)
-                .map(|_| {
-                    let mut v = 0;
-                    while v == 0 {
-                        v = (rng.next() as u16) & F::MASK;
-                    }
-                    v
-                })
-                .collect();
-
-            let expected: Vec<u16> = values.iter().map(|&v| F::inv(v)).collect();
-
-            let mut actual = values.clone();
-            let mut scratch = vec![0u16; len];
-            batch_invert::<F>(&mut actual, &mut scratch);
-
-            assert_eq!(actual, expected, "length {len}");
-            for (&inverse, &value) in actual.iter().zip(values.iter()) {
-                assert_eq!(F::mul(inverse, value), 1);
-            }
-        }
-    }
-
     #[test]
     fn addition_is_exclusive_or() {
         assert_eq!(add(0x0F0F, 0xF0F0), 0xFFFF);
@@ -567,12 +503,6 @@ mod tests {
         fn gf12_matches_long_division() {
             const POLY12: u32 = (1 << 12) | (1 << 3) | 1;
             field_agrees_with_long_division::<Gf12>(POLY12);
-        }
-
-        #[cfg(feature = "decapsulate")]
-        #[test]
-        fn gf12_batch_inversion() {
-            batch_matches_individual_inverses::<Gf12>(0x1357_9BDF_2468_ACE0);
         }
 
         #[test]
@@ -587,12 +517,6 @@ mod tests {
         fn gf13_matches_long_division() {
             const POLY13: u32 = (1 << 13) | (1 << 4) | (1 << 3) | (1 << 1) | 1;
             field_agrees_with_long_division::<Gf13>(POLY13);
-        }
-
-        #[cfg(feature = "decapsulate")]
-        #[test]
-        fn gf13_batch_inversion() {
-            batch_matches_individual_inverses::<Gf13>(0x0FED_CBA9_8765_4321);
         }
 
         #[test]

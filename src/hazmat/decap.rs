@@ -5,10 +5,11 @@
 //! Decapsulation: syndrome computation, Berlekamp-Massey decoding and implicit rejection.
 
 use super::benes::apply_benes;
-use super::fft::{eval_all_bitrev, eval_transpose_bitrev};
-use super::field::{Field, add, batch_invert, is_zero_mask};
+use super::fft::{eval_all_bitrev_sliced, eval_transpose_bitrev_sliced, sliced_words};
+use super::field::{Field, add};
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, HASH_REJECTION, hash_32};
 use super::params::Params;
+use super::vec::{LANES, MAX_BITS, Slice, Tables, Word};
 
 /// Read the Goppa polynomial from a private key, appending its implicit leading one.
 pub(crate) fn load_goppa<P: Params>(sk: &[u8], goppa: &mut [u16]) {
@@ -26,41 +27,64 @@ fn control_bits<P: Params>(sk: &[u8]) -> &[u8] {
     &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES]
 }
 
-/// The position weighting `1 / g(alpha)^2` for every field element, in bit-reversed order.
+/// The position weighting `1 / g(alpha)^2` for every field element, bit-sliced.
 ///
 /// `g` is irreducible of degree at least two, so it has no root anywhere in `F_q` and every
-/// inverse below is well defined.
-fn scaling<P: Params>(out: &mut [u16], goppa: &[u16], scratch: &mut [u16]) {
-    debug_assert_eq!(out.len(), P::Q);
+/// inverse below is well defined. Inverting in bit-sliced form costs four multiplications and a
+/// dozen squarings per group of lanes, which beats a scalar batched inversion here because
+/// squaring in this representation is only exclusive-ors.
+fn scaling<P: Params>(out: &mut [Word], goppa: &[u16], tables: &Tables<P::Field>) {
+    debug_assert_eq!(out.len(), sliced_words::<P>());
 
-    eval_all_bitrev::<P>(out, goppa);
-    for slot in out.iter_mut() {
-        *slot = P::Field::sq(*slot);
+    eval_all_bitrev_sliced::<P>(out, goppa, tables);
+
+    let planes = P::M;
+    let mut squared = [0; MAX_BITS];
+    let mut inverted = [0; MAX_BITS];
+
+    for group in 0..P::Q / LANES {
+        let mut value: Slice = [0; MAX_BITS];
+        value[..planes].copy_from_slice(&out[group * planes..group * planes + planes]);
+
+        tables.sq(&mut squared, &value);
+        tables.inv(&mut inverted, &squared);
+
+        out[group * planes..group * planes + planes].copy_from_slice(&inverted[..planes]);
     }
-    batch_invert::<P::Field>(out, scratch);
 }
 
 /// Compute the length-`2t` syndrome from a bit-reversed-order received word.
 ///
-/// Entry `j` is `sum_k scale[k] * bits[k] * bitrev(k)^j`. Written out, that is one geometric
-/// series per field element and costs `q * 2t` field multiplications; it is instead the
-/// transpose of multipoint evaluation, so the transposed additive FFT produces it in about
-/// `(q/2) * log2(2t)` multiplications.
+/// Entry `j` is `sum_k scale[k] * bits[k] * bitrev(k)^j`, which is the transpose of multipoint
+/// evaluation and so comes straight out of the transposed transform.
 ///
-/// `weighted` is caller-supplied scratch of `q` elements, since decoding needs two syndromes.
-fn syndrome<P: Params>(out: &mut [u16], scale: &[u16], bits: &[u8], weighted: &mut [u16]) {
+/// `weighted` is caller-supplied scratch, since decoding needs two syndromes.
+fn syndrome<P: Params>(
+    out: &mut [u16],
+    scale: &[Word],
+    bits: &[u8],
+    weighted: &mut [Word],
+    tables: &Tables<P::Field>,
+) {
     debug_assert_eq!(out.len(), 2 * P::T);
-    debug_assert_eq!(scale.len(), P::Q);
-    debug_assert_eq!(weighted.len(), P::Q);
+    debug_assert_eq!(scale.len(), sliced_words::<P>());
+    debug_assert_eq!(weighted.len(), sliced_words::<P>());
 
-    // Folding the received bit into the weighting is what makes the sum linear in the input,
-    // and therefore expressible as the transpose.
-    for (k, slot) in weighted.iter_mut().enumerate() {
-        let bit = ((bits[k / 8] >> (k % 8)) & 1) as u16;
-        *slot = scale[k] & 0u16.wrapping_sub(bit);
+    // Selecting by the received bit is a mask over whole lanes: the bit vector already carries
+    // one bit per element, which is one bit per lane.
+    let planes = P::M;
+    for group in 0..P::Q / LANES {
+        let byte = group * (LANES / 8);
+        let mut select: Word = 0;
+        for i in 0..LANES / 8 {
+            select |= Word::from(bits[byte + i]) << (i * 8);
+        }
+        for i in 0..planes {
+            weighted[group * planes + i] = scale[group * planes + i] & select;
+        }
     }
 
-    eval_transpose_bitrev::<P>(out, weighted);
+    eval_transpose_bitrev_sliced::<P>(out, weighted, tables);
 }
 
 /// Berlekamp-Massey: recover the error locator polynomial from a syndrome.
@@ -155,33 +179,49 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     valid[..P::N_BYTES].fill(0xFF);
     apply_benes::<P>(&mut valid, cond, true);
 
-    // The weighting depends only on the key, so both syndromes below share it. `weighted`
-    // doubles as scratch for the batched inversion before the syndromes need it.
-    let mut weighted = vec![0u16; P::Q];
-    let mut scale = vec![0u16; P::Q];
-    scaling::<P>(&mut scale, &goppa, &mut weighted);
+    // The weighting depends only on the key, so both syndromes below share it.
+    let tables = Tables::<P::Field>::new();
+    let mut weighted = vec![0; sliced_words::<P>()];
+    let mut scale = vec![0; sliced_words::<P>()];
+    scaling::<P>(&mut scale, &goppa, &tables);
 
     let mut s = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut s, &scale, &received, &mut weighted);
+    syndrome::<P>(&mut s, &scale, &received, &mut weighted, &tables);
 
     let mut locator = vec![0u16; P::T + 1];
     berlekamp_massey::<P>(&mut locator, &s);
 
-    let mut images = vec![0u16; P::Q];
-    eval_all_bitrev::<P>(&mut images, &locator);
+    let mut images = vec![0; sliced_words::<P>()];
+    eval_all_bitrev_sliced::<P>(&mut images, &locator, &tables);
 
+    // A locator root is a lane whose every bit-plane is zero, so the whole root search is an
+    // or-reduction across the planes rather than a test per element.
+    let planes = P::M;
     let mut error = vec![0u8; plane];
     let mut weight = 0u16;
-    for (k, &image) in images.iter().enumerate() {
-        let is_root = (is_zero_mask(image) & 1) as u8 & ((valid[k / 8] >> (k % 8)) & 1);
-        error[k / 8] |= is_root << (k % 8);
-        weight += is_root as u16;
+    for group in 0..P::Q / LANES {
+        let mut any: Word = 0;
+        for i in 0..planes {
+            any |= images[group * planes + i];
+        }
+
+        let byte = group * (LANES / 8);
+        let mut allowed: Word = 0;
+        for i in 0..LANES / 8 {
+            allowed |= Word::from(valid[byte + i]) << (i * 8);
+        }
+
+        let roots = !any & allowed;
+        weight += roots.count_ones() as u16;
+        for i in 0..LANES / 8 {
+            error[byte + i] = (roots >> (i * 8)) as u8;
+        }
     }
 
     // The decoder is only trusted when the recovered `e` has weight exactly `t` and reproduces
     // the syndrome, which is the `wt(e) = t and C = He` condition of the specification.
     let mut recomputed = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut recomputed, &scale, &error, &mut weighted);
+    syndrome::<P>(&mut recomputed, &scale, &error, &mut weighted, &tables);
 
     let mut check = weight ^ (P::T as u16);
     for (a, b) in s.iter().zip(recomputed.iter()) {
