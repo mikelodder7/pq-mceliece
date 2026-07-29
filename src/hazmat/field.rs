@@ -66,7 +66,9 @@ pub trait Field:
     ///
     /// Field orderings are defined in terms of `sum_j pi(i)_j z^(m-1-j)`, i.e. the bits of the
     /// permutation image read in the opposite order, so this conversion appears wherever a
-    /// permutation is turned into a support element.
+    /// permutation is turned into a support element. Decoding folds it into the evaluation
+    /// basis of the transposed transform instead, so only key generation calls it directly.
+    #[cfg(any(feature = "keygen", test))]
     fn bitrev(a: Elem) -> Elem {
         let mut a = a;
         a = ((a & 0x00FF) << 8) | ((a & 0xFF00) >> 8);

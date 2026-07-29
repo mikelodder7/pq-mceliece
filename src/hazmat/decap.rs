@@ -5,18 +5,10 @@
 //! Decapsulation: syndrome computation, Berlekamp-Massey decoding and implicit rejection.
 
 use super::benes::apply_benes;
-use super::fft::eval_all_bitrev;
+use super::fft::{eval_all_bitrev, eval_transpose_bitrev};
 use super::field::{Field, add, is_zero_mask};
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, HASH_REJECTION, hash_32};
 use super::params::Params;
-
-/// How many field elements to advance through the syndrome series at once.
-///
-/// Each element's series is a serial chain of multiplications, so running one element at a time
-/// would sit at the latency of the field multiplier rather than its throughput. Eight is enough
-/// to cover the latency of both the carry-less-multiply and the portable multiplier without
-/// running out of registers.
-const SERIES_LANES: usize = 8;
 
 /// Read the Goppa polynomial from a private key, appending its implicit leading one.
 pub(crate) fn load_goppa<P: Params>(sk: &[u8], goppa: &mut [u16]) {
@@ -49,42 +41,25 @@ fn scaling<P: Params>(out: &mut [u16], goppa: &[u16]) {
 
 /// Compute the length-`2t` syndrome from a bit-reversed-order received word.
 ///
-/// Entry `j` is `sum_k scale[k] * bits[k] * bitrev(k)^j`. Index `k` stands for the field
-/// element `bitrev(k)`, which is the ordering [`eval_all_bitrev`] produces and the ordering the
-/// Beneš network maps positions into.
-fn syndrome<P: Params>(out: &mut [u16], scale: &[u16], bits: &[u8]) {
+/// Entry `j` is `sum_k scale[k] * bits[k] * bitrev(k)^j`. Written out, that is one geometric
+/// series per field element and costs `q * 2t` field multiplications; it is instead the
+/// transpose of multipoint evaluation, so the transposed additive FFT produces it in about
+/// `(q/2) * log2(2t)` multiplications.
+///
+/// `weighted` is caller-supplied scratch of `q` elements, since decoding needs two syndromes.
+fn syndrome<P: Params>(out: &mut [u16], scale: &[u16], bits: &[u8], weighted: &mut [u16]) {
     debug_assert_eq!(out.len(), 2 * P::T);
     debug_assert_eq!(scale.len(), P::Q);
+    debug_assert_eq!(weighted.len(), P::Q);
 
-    out.fill(0);
-
-    // Each element contributes the geometric series `w, w*a, w*a^2, ...`, which is a serial
-    // chain of multiplications. Elements are independent of one another, so several are
-    // advanced in lockstep to keep the multiplier busy.
-    let mut base = 0usize;
-    while base < P::Q {
-        let mut weight = [0u16; SERIES_LANES];
-        let mut point = [0u16; SERIES_LANES];
-        for (lane, (w, a)) in weight.iter_mut().zip(point.iter_mut()).enumerate() {
-            let k = base + lane;
-            // Folding the selection bit into the first term rather than into every term saves
-            // `2t` masking operations, and is equivalent because the whole series is scaled
-            // by it.
-            let bit = ((bits[k / 8] >> (k % 8)) & 1) as u16;
-            *w = scale[k] & 0u16.wrapping_sub(bit);
-            *a = P::Field::bitrev(k as u16);
-        }
-
-        for slot in out.iter_mut() {
-            let mut acc = 0u16;
-            for (w, &a) in weight.iter_mut().zip(point.iter()) {
-                acc = add(acc, *w);
-                *w = P::Field::mul(*w, a);
-            }
-            *slot = add(*slot, acc);
-        }
-        base += SERIES_LANES;
+    // Folding the received bit into the weighting is what makes the sum linear in the input,
+    // and therefore expressible as the transpose.
+    for (k, slot) in weighted.iter_mut().enumerate() {
+        let bit = ((bits[k / 8] >> (k % 8)) & 1) as u16;
+        *slot = scale[k] & 0u16.wrapping_sub(bit);
     }
+
+    eval_transpose_bitrev::<P>(out, weighted);
 }
 
 /// Berlekamp-Massey: recover the error locator polynomial from a syndrome.
@@ -183,8 +158,9 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     let mut scale = vec![0u16; P::Q];
     scaling::<P>(&mut scale, &goppa);
 
+    let mut weighted = vec![0u16; P::Q];
     let mut s = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut s, &scale, &received);
+    syndrome::<P>(&mut s, &scale, &received, &mut weighted);
 
     let mut locator = vec![0u16; P::T + 1];
     berlekamp_massey::<P>(&mut locator, &s);
@@ -203,7 +179,7 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     // The decoder is only trusted when the recovered `e` has weight exactly `t` and reproduces
     // the syndrome, which is the `wt(e) = t and C = He` condition of the specification.
     let mut recomputed = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut recomputed, &scale, &error);
+    syndrome::<P>(&mut recomputed, &scale, &error, &mut weighted);
 
     let mut check = weight ^ (P::T as u16);
     for (a, b) in s.iter().zip(recomputed.iter()) {
@@ -216,6 +192,7 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
 
     use zeroize::Zeroize;
     goppa.zeroize();
+    weighted.zeroize();
     received.zeroize();
     valid.zeroize();
     scale.zeroize();

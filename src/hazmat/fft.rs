@@ -51,6 +51,77 @@ fn taylor(g: &mut [u16]) {
     taylor(high);
 }
 
+/// The transpose of [`taylor`], as a linear map over `F_q`.
+///
+/// Transposing a product of elementary row additions reverses their order and swaps each
+/// source with its destination, so the fold runs upwards and writes the other way round, and
+/// the recursion happens before it rather than after.
+fn taylor_transpose(g: &mut [u16]) {
+    let n = g.len();
+    if n <= 2 {
+        return;
+    }
+    debug_assert!(n.is_power_of_two());
+
+    let quarter = n / 4;
+    {
+        let (low, high) = g.split_at_mut(n / 2);
+        taylor_transpose(low);
+        taylor_transpose(high);
+    }
+
+    for i in n / 2..n {
+        g[i] ^= g[i - quarter];
+    }
+}
+
+/// The per-level constants shared by the transform and its transpose.
+///
+/// Every node at a given depth sees the same basis and the same zero offset, so the scaling
+/// factor and the normalized basis depend on the depth alone.
+struct Levels {
+    /// The basis element each depth rescales by.
+    betas: Vec<u16>,
+    /// The remaining basis at each depth, normalized so the rescaled element is one.
+    gammas: Vec<Vec<u16>>,
+}
+
+fn levels_for<P: Params>(count: usize, mut basis: Vec<u16>) -> Levels {
+    let mut betas = Vec::with_capacity(count);
+    let mut gammas = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        let beta = basis[basis.len() - 1];
+        let beta_inverse = P::Field::inv(beta);
+        let gamma: Vec<u16> = basis[..basis.len() - 1]
+            .iter()
+            .map(|&b| P::Field::mul(b, beta_inverse))
+            .collect();
+        basis = gamma.iter().map(|&g| P::Field::sq(g) ^ g).collect();
+        betas.push(beta);
+        gammas.push(gamma);
+    }
+
+    Levels { betas, gammas }
+}
+
+/// Fill `prefix` so that walking `j` upwards accumulates the basis elements its bits select.
+///
+/// Counting from `j - 1` to `j` clears the trailing ones and sets one further bit, so the delta
+/// is the prefix exclusive-or up to `j.trailing_zeros()`.
+fn subspace_prefix(prefix: &mut [u16; 16], gamma: &[u16]) {
+    let mut running = 0u16;
+    for (slot, &g) in prefix.iter_mut().zip(gamma.iter()) {
+        running ^= g;
+        *slot = running;
+    }
+}
+
+/// The bit-reversed evaluation basis: index `k` stands for the field element `bitrev(k)`.
+fn reversed_basis<P: Params>() -> Vec<u16> {
+    (0..P::M).map(|i| 1u16 << (P::M - 1 - i)).collect()
+}
+
 /// Evaluate `f` at every element of `F_q`, writing `out[a] = f(a)`.
 ///
 /// The decoder uses [`eval_all_bitrev`]; this natural ordering is what the tests state
@@ -69,23 +140,21 @@ pub(crate) fn eval_all<P: Params>(out: &mut [u16], f: &[u16]) {
 /// evaluations out this way lets the Beneš network line them up against positions without any
 /// secret-dependent lookup.
 pub(crate) fn eval_all_bitrev<P: Params>(out: &mut [u16], f: &[u16]) {
-    let basis: Vec<u16> = (0..P::M).map(|i| 1u16 << (P::M - 1 - i)).collect();
-    evaluate::<P>(out, f, basis);
+    evaluate::<P>(out, f, reversed_basis::<P>());
 }
 
 /// Evaluate `f` over all of `F_q`, with output index `j` holding the evaluation at
 /// `sum_i bit_i(j) * basis[i]`.
 ///
-/// The transform is written as two flat passes rather than as a recursion. Every node at a
-/// given depth shares the same basis and the same zero offset, so all the per-node quantities
-/// the recursive form recomputes are in fact per-level constants, and the coefficient blocks
-/// can live side by side in one array instead of in separately allocated halves.
-fn evaluate<P: Params>(out: &mut [u16], f: &[u16], mut basis: Vec<u16>) {
+/// The transform is written as two flat passes rather than as a recursion, since all the
+/// per-node quantities a recursion would recompute are really per-level constants.
+fn evaluate<P: Params>(out: &mut [u16], f: &[u16], basis: Vec<u16>) {
     debug_assert_eq!(out.len(), P::Q);
 
     let length = f.len().next_power_of_two();
     let levels = length.trailing_zeros() as usize;
     debug_assert!(levels <= P::M);
+    let plan = levels_for::<P>(levels, basis);
 
     let mut coefficients = vec![0u16; length];
     coefficients[..f.len()].copy_from_slice(f);
@@ -93,11 +162,8 @@ fn evaluate<P: Params>(out: &mut [u16], f: &[u16], mut basis: Vec<u16>) {
     // Coefficient pass: rescale, rewrite in powers of tau, and split even from odd digits.
     // After `levels` rounds each entry is the constant one leaf of the recursion would see.
     let mut scratch = vec![0u16; length];
-    let mut gammas: Vec<Vec<u16>> = Vec::with_capacity(levels);
-
     for depth in 0..levels {
-        let beta = basis[basis.len() - 1];
-        let beta_inverse = P::Field::inv(beta);
+        let beta = plan.betas[depth];
         let block = length >> depth;
         let half = block / 2;
 
@@ -118,13 +184,6 @@ fn evaluate<P: Params>(out: &mut [u16], f: &[u16], mut basis: Vec<u16>) {
             }
             segment.copy_from_slice(&scratch[..block]);
         }
-
-        let gamma: Vec<u16> = basis[..basis.len() - 1]
-            .iter()
-            .map(|&b| P::Field::mul(b, beta_inverse))
-            .collect();
-        basis = gamma.iter().map(|&g| P::Field::sq(g) ^ g).collect();
-        gammas.push(gamma);
     }
 
     // Each leaf constant takes the same value across its whole output block.
@@ -136,23 +195,11 @@ fn evaluate<P: Params>(out: &mut [u16], f: &[u16], mut basis: Vec<u16>) {
     // Butterfly pass, deepest level first. `tau(w) = tau(w + 1)` in characteristic two, so the
     // two halves of a block share a sub-evaluation and differ only by the top basis element.
     let mut prefix = [0u16; 16];
-
     for depth in (0..levels).rev() {
-        let gamma = &gammas[depth];
         let block = P::Q >> depth;
         let half = block / 2;
-        debug_assert_eq!(half, 1 << gamma.len());
-
-        // Walking `j` upwards, the selected basis elements change by a prefix exclusive-or:
-        // counting from `j - 1` clears the trailing ones and sets one more bit. Keeping the
-        // running sum in a local rather than a table keeps it in a register through the inner
-        // loop, which is the hottest one in the transform. Both indices are loop counters,
-        // never secret data.
-        let mut running = 0u16;
-        for (slot, &g) in prefix.iter_mut().zip(gamma.iter()) {
-            running ^= g;
-            *slot = running;
-        }
+        debug_assert_eq!(half, 1 << plan.gammas[depth].len());
+        subspace_prefix(&mut prefix, &plan.gammas[depth]);
 
         for start in (0..P::Q).step_by(block) {
             let (low, high) = out[start..start + block].split_at_mut(half);
@@ -169,6 +216,91 @@ fn evaluate<P: Params>(out: &mut [u16], f: &[u16], mut basis: Vec<u16>) {
             }
         }
     }
+}
+
+/// Apply the transpose of [`eval_all_bitrev`], writing `out[j] = sum_k values[k] * bitrev(k)^j`.
+///
+/// That sum is exactly the Goppa syndrome, so decoding gets it for the price of one transform
+/// instead of the `q * 2t` field multiplications the direct series costs.
+///
+/// Multipoint evaluation is a linear map, and its matrix is the transpose of the one the
+/// syndrome needs. So the transpose is the same three passes run backwards, with each step
+/// replaced by its own transpose: the butterfly's two-by-two matrix flipped, the broadcast that
+/// fills a leaf block turned into a sum over it, the even-odd split turned back into an
+/// interleave, and the Taylor step reversed. Rescaling is diagonal and transposes to itself.
+pub(crate) fn eval_transpose_bitrev<P: Params>(out: &mut [u16], values: &[u16]) {
+    debug_assert_eq!(values.len(), P::Q);
+
+    let length = out.len().next_power_of_two();
+    let levels = length.trailing_zeros() as usize;
+    debug_assert!(levels <= P::M);
+    let plan = levels_for::<P>(levels, reversed_basis::<P>());
+
+    let mut work = values.to_vec();
+
+    // Butterflies transposed: the level order reverses, and each two-by-two step becomes
+    // `(low, high) -> (low + high, high + omega (low + high))`.
+    let mut prefix = [0u16; 16];
+    for depth in 0..levels {
+        let block = P::Q >> depth;
+        let half = block / 2;
+        debug_assert_eq!(half, 1 << plan.gammas[depth].len());
+        subspace_prefix(&mut prefix, &plan.gammas[depth]);
+
+        for start in (0..P::Q).step_by(block) {
+            let (low, high) = work[start..start + block].split_at_mut(half);
+
+            low[0] ^= high[0];
+
+            let mut omega = 0u16;
+            for j in 1..half {
+                omega ^= prefix[j.trailing_zeros() as usize];
+                let sum = low[j] ^ high[j];
+                high[j] ^= P::Field::mul(omega, sum);
+                low[j] = sum;
+            }
+        }
+    }
+
+    // Broadcasting a constant across a leaf block transposes into summing that block.
+    let span = P::Q >> levels;
+    let mut coefficients = vec![0u16; length];
+    for (leaf, slot) in coefficients.iter_mut().enumerate() {
+        let mut acc = 0u16;
+        for &value in &work[leaf * span..(leaf + 1) * span] {
+            acc ^= value;
+        }
+        *slot = acc;
+    }
+
+    // Coefficient pass transposed: the level order reverses, and within a level the even-odd
+    // split becomes an interleave and the Taylor step runs backwards.
+    let mut scratch = vec![0u16; length];
+    for depth in (0..levels).rev() {
+        let beta = plan.betas[depth];
+        let block = length >> depth;
+        let half = block / 2;
+
+        for start in (0..length).step_by(block) {
+            let segment = &mut coefficients[start..start + block];
+
+            for i in 0..half {
+                scratch[2 * i] = segment[i];
+                scratch[2 * i + 1] = segment[half + i];
+            }
+            segment.copy_from_slice(&scratch[..block]);
+
+            taylor_transpose(segment);
+
+            let mut power = 1u16;
+            for coefficient in segment.iter_mut() {
+                *coefficient = P::Field::mul(*coefficient, power);
+                power = P::Field::mul(power, beta);
+            }
+        }
+    }
+
+    out.copy_from_slice(&coefficients[..out.len()]);
 }
 
 #[cfg(test)]
@@ -281,6 +413,68 @@ mod tests {
         }
     }
 
+    /// The transpose must satisfy the defining adjoint identity `<Vc, w> = <c, transpose(V) w>`
+    /// for every pair of vectors, which pins it down completely.
+    fn transpose_is_adjoint_to_evaluation<P: Params>(seed: u64) {
+        let mut rng = Rng(seed);
+        let width = 2 * P::T;
+
+        for _ in 0..4 {
+            let c: Vec<u16> = (0..width)
+                .map(|_| (rng.next() as u16) & <P::Field as Field>::MASK)
+                .collect();
+            let w: Vec<u16> = (0..P::Q)
+                .map(|_| (rng.next() as u16) & <P::Field as Field>::MASK)
+                .collect();
+
+            let mut evaluated = vec![0u16; P::Q];
+            eval_all_bitrev::<P>(&mut evaluated, &c);
+            let mut left = 0u16;
+            for (v, x) in evaluated.iter().zip(w.iter()) {
+                left ^= <P::Field as Field>::mul(*v, *x);
+            }
+
+            let mut transposed = vec![0u16; width];
+            eval_transpose_bitrev::<P>(&mut transposed, &w);
+            let mut right = 0u16;
+            for (s, x) in transposed.iter().zip(c.iter()) {
+                right ^= <P::Field as Field>::mul(*s, *x);
+            }
+
+            assert_eq!(left, right, "{} adjoint identity", P::NAME);
+        }
+    }
+
+    /// And it must equal the syndrome sum written out directly.
+    fn transpose_matches_the_syndrome_sum<P: Params>(seed: u64) {
+        let mut rng = Rng(seed);
+        let width = 2 * P::T;
+
+        // A sparse input keeps the reference sum cheap while still covering the whole domain.
+        let mut w = vec![0u16; P::Q];
+        for _ in 0..64 {
+            let k = (rng.next() as usize) % P::Q;
+            w[k] = (rng.next() as u16) & <P::Field as Field>::MASK;
+        }
+
+        let mut expected = vec![0u16; width];
+        for (k, &weight) in w.iter().enumerate() {
+            if weight == 0 {
+                continue;
+            }
+            let point = <P::Field as Field>::bitrev(k as u16);
+            let mut power = 1u16;
+            for slot in expected.iter_mut() {
+                *slot ^= <P::Field as Field>::mul(weight, power);
+                power = <P::Field as Field>::mul(power, point);
+            }
+        }
+
+        let mut actual = vec![0u16; width];
+        eval_transpose_bitrev::<P>(&mut actual, &w);
+        assert_eq!(actual, expected, "{} syndrome sum", P::NAME);
+    }
+
     /// The zero polynomial and constants are the recursion's base cases.
     fn constants_evaluate_everywhere<P: Params>() {
         let mut out = vec![0u16; P::Q];
@@ -329,6 +523,16 @@ mod tests {
                     #[test]
                     fn bitrev_matches_natural_order() {
                         bitrev_ordering_matches::<$params>($seed ^ 3);
+                    }
+
+                    #[test]
+                    fn transpose_is_adjoint() {
+                        transpose_is_adjoint_to_evaluation::<$params>($seed ^ 4);
+                    }
+
+                    #[test]
+                    fn transpose_equals_the_syndrome_sum() {
+                        transpose_matches_the_syndrome_sum::<$params>($seed ^ 5);
                     }
                 }
             )+
