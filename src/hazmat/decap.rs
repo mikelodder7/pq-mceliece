@@ -6,7 +6,7 @@
 
 use super::benes::apply_benes;
 use super::fft::{eval_all_bitrev, eval_transpose_bitrev};
-use super::field::{Field, add, is_zero_mask};
+use super::field::{Field, add, batch_invert, is_zero_mask};
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, HASH_REJECTION, hash_32};
 use super::params::Params;
 
@@ -30,13 +30,14 @@ fn control_bits<P: Params>(sk: &[u8]) -> &[u8] {
 ///
 /// `g` is irreducible of degree at least two, so it has no root anywhere in `F_q` and every
 /// inverse below is well defined.
-fn scaling<P: Params>(out: &mut [u16], goppa: &[u16]) {
+fn scaling<P: Params>(out: &mut [u16], goppa: &[u16], scratch: &mut [u16]) {
     debug_assert_eq!(out.len(), P::Q);
 
     eval_all_bitrev::<P>(out, goppa);
     for slot in out.iter_mut() {
-        *slot = P::Field::inv(P::Field::sq(*slot));
+        *slot = P::Field::sq(*slot);
     }
+    batch_invert::<P::Field>(out, scratch);
 }
 
 /// Compute the length-`2t` syndrome from a bit-reversed-order received word.
@@ -154,11 +155,12 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     valid[..P::N_BYTES].fill(0xFF);
     apply_benes::<P>(&mut valid, cond, true);
 
-    // The weighting depends only on the key, so both syndromes below share it.
-    let mut scale = vec![0u16; P::Q];
-    scaling::<P>(&mut scale, &goppa);
-
+    // The weighting depends only on the key, so both syndromes below share it. `weighted`
+    // doubles as scratch for the batched inversion before the syndromes need it.
     let mut weighted = vec![0u16; P::Q];
+    let mut scale = vec![0u16; P::Q];
+    scaling::<P>(&mut scale, &goppa, &mut weighted);
+
     let mut s = vec![0u16; 2 * P::T];
     syndrome::<P>(&mut s, &scale, &received, &mut weighted);
 
