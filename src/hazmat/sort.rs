@@ -71,20 +71,34 @@ macro_rules! sorter {
                 // chain stays in a register, which is why the loops are not swapped here:
                 // hoisting the chain outward and sweeping runs vectorizes the inner step but
                 // spills the carried value to memory, and measured slower at every width
-                // tried.
-                // This stage carries a value down a chain of strides. The chain is serial, but
-                // neighbouring indices are independent, so a fixed number of them advance
-                // together. The width has to be a compile-time constant: with a runtime length
-                // the carried values spill to memory and the whole gain disappears.
+                // tried. Neighbouring indices are independent, though, so a fixed number of
+                // them advance together. The width has to be a compile-time constant: with a
+                // runtime length the carried values spill to memory and the gain disappears.
+                //
+                // `index` deliberately carries across the whole `q` loop instead of restarting
+                // at zero. Each index belongs to exactly one `q` -- the largest one it fits
+                // under -- and since `n - q` only grows as `q` shrinks, sweeping from where the
+                // previous `q` stopped visits every index once. Restarting would repeat the
+                // earlier indices under every smaller stride, which still sorts but costs
+                // nearly four times the comparisons at these lengths.
+                let mut index = 0;
                 let mut q = top;
                 while q > p {
-                    let mut base = 0;
-                    while base < n - q {
-                        let run = p.min(n - q - base);
+                    let limit = n - q;
+                    while index < limit {
+                        // Indices with this bit clear come in contiguous runs of `p` starting
+                        // at multiples of `2 * p`, so the run holding `index` ends here.
+                        let block_end = (index | (p - 1)) + 1;
+                        if index & p != 0 {
+                            index = block_end;
+                            continue;
+                        }
+                        let end = block_end.min(limit);
+                        let run = end - index;
 
                         let mut offset = 0;
                         while offset + CHAIN_WIDTH <= run {
-                            let i = base + offset;
+                            let i = index + offset;
                             let mut carry = [<$ty>::default(); CHAIN_WIDTH];
                             carry.copy_from_slice(&x[i + p..i + p + CHAIN_WIDTH]);
 
@@ -103,7 +117,7 @@ macro_rules! sorter {
                             offset += CHAIN_WIDTH;
                         }
 
-                        for i in base + offset..base + run {
+                        for i in index + offset..end {
                             let mut a = x[i + p];
                             let mut r = q;
                             while r > p {
@@ -115,7 +129,7 @@ macro_rules! sorter {
                             x[i + p] = a;
                         }
 
-                        base += p * 2;
+                        index = end;
                     }
                     q >>= 1;
                 }
@@ -185,11 +199,9 @@ mod tests {
     #[test]
     fn sorting_matches_the_standard_library_for_many_lengths() {
         let mut rng = Rng(0x1234_5678_9ABC_DEF0);
-        // Lengths that are powers of two, and lengths that are not, exercise both the
-        // fast path and the ragged tail of the network.
-        for len in [
-            0usize, 1, 2, 3, 5, 8, 16, 17, 63, 64, 100, 128, 255, 256, 1000,
-        ] {
+        // Every short length, so no combination of stride, run boundary and ragged tail goes
+        // untried, plus a few large ones and the shortest parameter-set support size.
+        for len in (0usize..300).chain([1000, 1024, 1025, 3488]) {
             let signed: Vec<i32> = (0..len).map(|_| rng.next() as i32).collect();
             let mut actual = signed.clone();
             sort_i32(&mut actual);
