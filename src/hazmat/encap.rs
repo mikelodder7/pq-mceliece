@@ -189,6 +189,13 @@ pub(crate) fn encapsulate<P: Params>(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6688128",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     use rand_core::{Rng, SeedableRng};
 
     #[test]
@@ -199,10 +206,24 @@ mod tests {
         assert_eq!(same_mask_u8(0, 0xFFFF), 0);
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6688128",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn weight(e: &[u8]) -> usize {
         e.iter().map(|b| b.count_ones() as usize).sum()
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6688128",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn fixed_weight_is_well_formed<P: Params>(seed: u8) {
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([seed; 32]);
         for _ in 0..4 {
@@ -216,6 +237,13 @@ mod tests {
     }
 
     /// `Encode` must agree with the definition `C = He` built from `H = (I | T)` directly.
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6688128",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn encode_matches_the_definition<P: Params>(seed: u8) {
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([seed; 32]);
 
@@ -250,6 +278,13 @@ mod tests {
         assert_eq!(actual, expected, "{}", P::NAME);
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6688128",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn padding_check_rejects_dirty_keys<P: Params>() {
         let mut pk = vec![0u8; P::PUBLIC_KEY_LENGTH];
         assert!(public_key_padding_is_zero::<P>(&pk));

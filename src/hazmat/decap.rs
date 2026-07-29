@@ -26,21 +26,34 @@ pub(crate) fn load_private_key<P: Params>(sk: &[u8], goppa: &mut [u16], support:
     support_gen::<P>(support, &sk[P::COND_OFFSET..P::COND_OFFSET + P::COND_BYTES]);
 }
 
+/// The per-position weighting `1 / g(alpha_i)^2` shared by every syndrome of a given key.
+///
+/// Both the decode syndrome and the re-encryption syndrome scale each position by exactly this,
+/// and it depends only on the private key, so it is computed once per decapsulation rather than
+/// once per syndrome.
+fn scaling<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16]) {
+    debug_assert_eq!(out.len(), support.len());
+
+    eval_many::<P>(out, goppa, support);
+    for slot in out.iter_mut() {
+        *slot = P::Field::inv(P::Field::sq(*slot));
+    }
+}
+
 /// Compute the length-`2t` syndrome of the received word `r` for the Goppa code `(g, alpha)`.
 ///
 /// Entry `j` is `sum_i r_i / g(alpha_i)^2 * alpha_i^j`, the standard Goppa syndrome in the
-/// alternant form the decoder expects.
-fn syndrome<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16], r: &[u8]) {
+/// alternant form the decoder expects. `scale` holds the `1 / g(alpha_i)^2` factors from
+/// [`scaling`].
+fn syndrome<P: Params>(out: &mut [u16], scale: &[u16], support: &[u16], r: &[u8]) {
     debug_assert_eq!(out.len(), 2 * P::T);
+    debug_assert_eq!(scale.len(), support.len());
 
     out.fill(0);
 
     // Each position contributes the geometric series `w, w*a, w*a^2, ...`, which is a serial
     // chain of multiplications. Positions are independent of one another, so several are
     // advanced in lockstep to keep the multiplier busy.
-    let mut values = vec![0u16; support.len()];
-    eval_many::<P>(&mut values, goppa, support);
-
     let mut points = support.chunks_exact(EVAL_LANES);
     let mut chunk_index = 0;
 
@@ -52,9 +65,7 @@ fn syndrome<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16], r: &[u8]
             // saves `2t` masking operations per position, and is equivalent because the
             // whole series is scaled by it.
             let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
-            let select = 0u16.wrapping_sub(bit);
-            let value = values[i];
-            *w = P::Field::inv(P::Field::sq(value)) & select;
+            *w = scale[i] & 0u16.wrapping_sub(bit);
         }
 
         for slot in out.iter_mut() {
@@ -71,18 +82,13 @@ fn syndrome<P: Params>(out: &mut [u16], goppa: &[u16], support: &[u16], r: &[u8]
     for (lane, &a) in points.remainder().iter().enumerate() {
         let i = chunk_index + lane;
         let bit = ((r[i / 8] >> (i % 8)) & 1) as u16;
-        let select = 0u16.wrapping_sub(bit);
-        let value = values[i];
-        let mut weight = P::Field::inv(P::Field::sq(value)) & select;
+        let mut weight = scale[i] & 0u16.wrapping_sub(bit);
 
         for slot in out.iter_mut() {
             *slot = add(*slot, weight);
             weight = P::Field::mul(weight, a);
         }
     }
-
-    use zeroize::Zeroize;
-    values.zeroize();
 }
 
 /// Berlekamp-Massey: recover the error locator polynomial from a syndrome.
@@ -158,8 +164,12 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], goppa: &[u16], support: &[u16], c0
     let mut received = vec![0u8; P::N_BYTES];
     received[..P::SYND_BYTES].copy_from_slice(c0);
 
+    // The position weighting depends only on the key, so both syndromes below share it.
+    let mut scale = vec![0u16; P::N];
+    scaling::<P>(&mut scale, goppa, support);
+
     let mut s = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut s, goppa, support, &received);
+    syndrome::<P>(&mut s, &scale, support, &received);
 
     let mut locator = vec![0u16; P::T + 1];
     berlekamp_massey::<P>(&mut locator, &s);
@@ -178,7 +188,7 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], goppa: &[u16], support: &[u16], c0
     // The decoder is only trusted when the recovered `e` has weight exactly `t` and reproduces
     // the syndrome, which is the `wt(e) = t and C = He` condition of the specification.
     let mut recomputed = vec![0u16; 2 * P::T];
-    syndrome::<P>(&mut recomputed, goppa, support, e);
+    syndrome::<P>(&mut recomputed, &scale, support, e);
 
     let mut check = weight ^ (P::T as u16);
     for (a, b) in s.iter().zip(recomputed.iter()) {
@@ -190,6 +200,7 @@ pub(crate) fn decode<P: Params>(e: &mut [u8], goppa: &[u16], support: &[u16], c0
     recomputed.zeroize();
     locator.zeroize();
     images.zeroize();
+    scale.zeroize();
 
     // `check == 0` exactly when decoding succeeded.
     0u8.wrapping_sub((check.wrapping_sub(1) >> 15) as u8)

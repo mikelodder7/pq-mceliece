@@ -161,9 +161,21 @@ pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) 
 #[cfg(all(test, feature = "keygen"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     use super::*;
 
     /// Multiply in `F_q[y]/F(y)` by explicit long division, as an oracle for `mul_mod_f`.
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn reference_mul<P: Params>(a: &[u16], b: &[u16]) -> Vec<u16> {
         let t = P::T;
         let mut prod = vec![0u16; 2 * t - 1];
@@ -182,8 +194,20 @@ mod tests {
         prod[..t].to_vec()
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     struct Rng(u64);
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     impl Rng {
         fn next(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
@@ -196,10 +220,22 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn random_element<P: Params>(rng: &mut Rng) -> Vec<u16> {
         (0..P::T).map(|_| rng.elem::<P::Field>()).collect()
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn multiplication_agrees_with_long_division<P: Params>(seed: u64) {
         let mut rng = Rng(seed);
         let mut scratch = vec![0u16; 2 * P::T];
@@ -212,6 +248,12 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn multiplication_is_commutative_and_has_an_identity<P: Params>(seed: u64) {
         let mut rng = Rng(seed);
         let mut scratch = vec![0u16; 2 * P::T];
@@ -236,6 +278,12 @@ mod tests {
     }
 
     /// `g(beta) = 0` in `F_q[y]/F(y)`, evaluated with Horner's rule in that ring.
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn minimal_polynomial_annihilates_its_generator<P: Params>(seed: u64) {
         let mut rng = Rng(seed);
         let mut scratch = vec![0u16; 2 * P::T];

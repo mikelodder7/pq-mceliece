@@ -291,11 +291,17 @@ pub(crate) fn support_gen<P: Params>(support: &mut [u16], cond: &[u8]) {
 #[cfg(all(test, feature = "keygen"))]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     use super::*;
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     use crate::hazmat::controlbits::control_bits_from_permutation;
 
+    // Every helper below feeds the two round-trip tests, which need a concrete parameter set
+    // of each field width.
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     struct Rng(u64);
 
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     impl Rng {
         fn next(&mut self) -> u64 {
             self.0 ^= self.0 << 13;
@@ -306,6 +312,7 @@ mod tests {
     }
 
     /// Build a pseudo-random permutation of `0..n` by Fisher-Yates.
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     fn permutation(n: usize, seed: u64) -> Vec<i16> {
         let mut rng = Rng(seed);
         let mut pi: Vec<i16> = (0..n as i16).collect();
@@ -320,6 +327,7 @@ mod tests {
     ///
     /// The control bits produced for `pi` drive a network that gathers: output position `i`
     /// receives the input at position `pi[i]`.
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     fn permute_bits(bits: &[u8], pi: &[i16]) -> Vec<u8> {
         let mut out = vec![0u8; bits.len()];
         for (i, &source) in pi.iter().enumerate() {
@@ -330,6 +338,7 @@ mod tests {
         out
     }
 
+    #[cfg(any(feature = "mceliece348864", feature = "mceliece8192128"))]
     fn round_trip<P: Params>(seed: u64) {
         let pi = permutation(P::Q, seed);
         let mut cond = vec![0u8; P::COND_BYTES];

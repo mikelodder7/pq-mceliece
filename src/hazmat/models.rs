@@ -337,6 +337,7 @@ mod tests {
 
         // The public key is recoverable from the private key.
         assert_eq!(EncapsulationKey::<P>::from(&dk), ek);
+        #[cfg(feature = "hazmat")]
         assert_eq!(dk.seed().len(), 32);
 
         // Wrong lengths are rejected.
