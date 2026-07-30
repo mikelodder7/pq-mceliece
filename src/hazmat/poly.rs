@@ -14,6 +14,10 @@
 use super::field::is_zero_mask;
 use super::field::{Field, add};
 use super::params::Params;
+#[cfg(feature = "keygen")]
+use ctutils::{Choice, CtAssign};
+#[cfg(feature = "keygen")]
+use zeroize::Zeroizing;
 
 /// Multiply `a` by `b` in `F_q[y]/F(y)`, where both operands have `t` coefficients.
 ///
@@ -64,8 +68,8 @@ pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool 
 
     // `mat[c]` holds the coefficient vector of `beta^c`, so solving the system for the
     // dependency among `1, beta, ..., beta^t` yields the minimal polynomial.
-    let mut mat = vec![0u16; (t + 1) * t];
-    let mut scratch = vec![0u16; 2 * t];
+    let mut mat = Zeroizing::new(vec![0u16; (t + 1) * t]);
+    let mut scratch = Zeroizing::new(vec![0u16; 2 * t]);
 
     mat[0] = 1;
     mat[t..2 * t].copy_from_slice(f);
@@ -84,8 +88,11 @@ pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool 
         // is still zero.
         for k in j + 1..t {
             let mask = is_zero_mask(mat[at(j, j)]);
+            let choice = Choice::from_u16_lsb(mask);
             for c in j..=t {
-                mat[at(c, j)] ^= mat[at(c, k)] & mask;
+                let destination = at(c, j);
+                let sum = mat[destination] ^ mat[at(c, k)];
+                mat[destination].ct_assign(&sum, choice);
             }
         }
 
@@ -119,9 +126,8 @@ pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool 
 ///
 /// `f` holds `t + 1` coefficients in ascending order, with `f[t] = 1` for a Goppa polynomial.
 ///
-/// Only key generation evaluates one point at a time; decoding uses the additive FFT to reach
-/// every point at once.
-#[cfg(feature = "keygen")]
+/// Kept as a scalar test oracle for the additive FFT used by key generation and decoding.
+#[cfg(test)]
 #[inline]
 pub(crate) fn eval<P: Params>(f: &[u16], a: u16) -> u16 {
     let mut r = f[P::T];
@@ -137,10 +143,11 @@ pub(crate) fn eval<P: Params>(f: &[u16], a: u16) -> u16 {
 /// at the latency of the field multiplier rather than its throughput. Evaluating several
 /// points in lockstep fills the pipeline; eight is enough to cover the latency of both the
 /// carry-less-multiply and the portable multiplier without running out of registers.
+#[cfg(test)]
 pub(crate) const EVAL_LANES: usize = 8;
 
-/// Evaluate `f` at every element of `support`, writing the results to `out`.
-#[cfg(feature = "keygen")]
+/// Scalar test oracle that evaluates `f` at every element of `support`.
+#[cfg(test)]
 pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) {
     debug_assert_eq!(out.len(), support.len());
 
@@ -320,6 +327,24 @@ mod tests {
         assert!(found > 0, "{} produced no irreducible polynomial", P::NAME);
     }
 
+    /// `Irreducible` must report the `⊥` outcome when `beta` does not generate the whole field,
+    /// since the caller's response is to restart with a fresh seed rather than to emit a key.
+    /// A constant `f` makes `beta` a scalar, which generates only `GF(2)`.
+    fn minimal_polynomial_rejects_a_proper_subfield<P: Params>() {
+        let mut out = vec![0u16; P::T];
+
+        // `beta = 0`, and `beta = 1`: both lie in `GF(2)`, a proper subfield for every `m`.
+        for constant in [0u16, 1] {
+            let mut f = vec![0u16; P::T];
+            f[0] = constant;
+            assert!(
+                !minimal_polynomial::<P>(&mut out, &f),
+                "{} constant {constant}",
+                P::NAME
+            );
+        }
+    }
+
     macro_rules! poly_tests {
         ($($feature:literal => $mod_name:ident, $params:ty, $seed:expr;)+) => {
             $(
@@ -336,6 +361,11 @@ mod tests {
                     #[test]
                     fn multiplication_is_a_commutative_monoid() {
                         multiplication_is_commutative_and_has_an_identity::<$params>($seed ^ 1);
+                    }
+
+                    #[test]
+                    fn minimal_polynomial_rejects_subfield_generators() {
+                        minimal_polynomial_rejects_a_proper_subfield::<$params>();
                     }
 
                     #[test]

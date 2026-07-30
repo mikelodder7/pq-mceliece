@@ -21,6 +21,709 @@ pub(crate) struct BitMatrix {
     data: Vec<u64>,
 }
 
+/// XOR `source` into `destination` when `condition` is one.
+///
+/// The lengths and addresses are public. `condition` is a secret matrix bit and must influence
+/// only predicated arithmetic, never control flow.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn xor_row_if(destination: &mut [u64], source: &[u64], condition: u64) {
+    use core::arch::asm;
+
+    debug_assert_eq!(destination.len(), source.len());
+
+    // SAFETY: both pointers cover `remaining` readable words, `destination` is writable, and
+    // Rust's mutable/shared borrows make the regions disjoint. The loop handles two words only
+    // while at least two remain, then handles at most one tail word. Its branches depend solely
+    // on the public length; the secret condition is used only to form a mask.
+    unsafe {
+        asm!(
+            "mov x9, {destination}",
+            "mov x10, {source}",
+            "mov x11, {remaining}",
+            "neg x12, {condition}",
+            "dup v0.2d, x12",
+            "cmp x11, #2",
+            "b.lo 3f",
+            "2:",
+            "ldr q1, [x10], #16",
+            "ldr q2, [x9]",
+            "and v1.16b, v1.16b, v0.16b",
+            "eor v2.16b, v2.16b, v1.16b",
+            "str q2, [x9], #16",
+            "sub x11, x11, #2",
+            "cmp x11, #2",
+            "b.hs 2b",
+            "3:",
+            "cbz x11, 4f",
+            "ldr x13, [x10]",
+            "ldr x14, [x9]",
+            "and x13, x13, x12",
+            "eor x14, x14, x13",
+            "str x14, [x9]",
+            "4:",
+            condition = in(reg) condition,
+            destination = in(reg) destination.as_mut_ptr(),
+            source = in(reg) source.as_ptr(),
+            remaining = in(reg) source.len(),
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            out("x12") _,
+            out("x13") _,
+            out("x14") _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(never)]
+fn xor_row_if(destination: &mut [u64], source: &[u64], condition: u64) {
+    use ctutils::{Choice, CtSelect};
+
+    debug_assert_eq!(destination.len(), source.len());
+    let choice = Choice::from_u64_lsb(condition);
+    for (destination, &source) in destination.iter_mut().zip(source.iter()) {
+        let sum = *destination ^ source;
+        *destination = destination.ct_select(&sum, choice);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! compact_xor_row_pair {
+    ($mask:literal) => {
+        concat!(
+            "ldp q2, q3, [x13]\n",
+            "and v4.16b, v0.16b, ",
+            $mask,
+            ".16b\n",
+            "and v5.16b, v1.16b, ",
+            $mask,
+            ".16b\n",
+            "eor v2.16b, v2.16b, v4.16b\n",
+            "eor v3.16b, v3.16b, v5.16b\n",
+            "stp q2, q3, [x13]\n",
+            "add x13, x13, x12"
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! compact_xor_row_one {
+    ($mask:literal) => {
+        concat!(
+            "ldr q1, [x13]\n",
+            "and v2.16b, v0.16b, ",
+            $mask,
+            ".16b\n",
+            "eor v1.16b, v1.16b, v2.16b\n",
+            "str q1, [x13]\n",
+            "add x13, x13, x12"
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! compact_xor_row_scalar {
+    ($mask:literal) => {
+        concat!(
+            "fmov x14, ",
+            $mask,
+            "\n",
+            "and x14, x8, x14\n",
+            "ldr x10, [x13]\n",
+            "eor x10, x10, x14\n",
+            "str x10, [x13]\n",
+            "add x13, x13, x12"
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! compact_xor_source_pair {
+    ($mask:literal) => {
+        concat!(
+            "ldp q2, q3, [x13]\n",
+            "and v2.16b, v2.16b, ",
+            $mask,
+            ".16b\n",
+            "and v3.16b, v3.16b, ",
+            $mask,
+            ".16b\n",
+            "eor v0.16b, v0.16b, v2.16b\n",
+            "eor v1.16b, v1.16b, v3.16b\n",
+            "add x13, x13, x12"
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! compact_xor_source_one {
+    ($mask:literal) => {
+        concat!(
+            "ldr q1, [x13]\n",
+            "and v1.16b, v1.16b, ",
+            $mask,
+            ".16b\n",
+            "eor v0.16b, v0.16b, v1.16b\n",
+            "add x13, x13, x12"
+        )
+    };
+}
+
+#[cfg(target_arch = "aarch64")]
+macro_rules! compact_xor_source_scalar {
+    ($mask:literal) => {
+        concat!(
+            "fmov x14, ",
+            $mask,
+            "\n",
+            "ldr x10, [x13]\n",
+            "and x10, x10, x14\n",
+            "eor x8, x8, x10\n",
+            "add x13, x13, x12"
+        )
+    };
+}
+
+/// XOR one source into eight destination rows using only caller-saved registers.
+///
+/// Streaming one destination at a time uses fewer live vectors than keeping all eight rows in
+/// registers. That avoids saving and restoring the ABI's callee-saved SIMD registers around
+/// every short elimination pass.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn xor_eight_rows_if_compact(
+    destinations: &mut [u64],
+    source: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: [u64; 8],
+) {
+    use core::arch::asm;
+
+    debug_assert_eq!(destinations.len(), 8 * stride);
+    debug_assert_eq!(source.len(), stride);
+
+    // SAFETY: the destination contains eight complete disjoint rows and the source is a ninth
+    // disjoint row. Adding `first` leaves `stride - first` valid words in every row. The main
+    // vector loop advances four words at a time; vector and scalar tails handle two and one.
+    // Secret conditions are used only to form masks. The assembly clobbers exclusively
+    // caller-saved integer and SIMD registers, so it needs no hidden save/restore traffic.
+    unsafe {
+        asm!(
+            "ldr x8, [{conditions}, #0]",
+            "neg x8, x8",
+            "dup v16.2d, x8",
+            "ldr x8, [{conditions}, #8]",
+            "neg x8, x8",
+            "dup v17.2d, x8",
+            "ldr x8, [{conditions}, #16]",
+            "neg x8, x8",
+            "dup v18.2d, x8",
+            "ldr x8, [{conditions}, #24]",
+            "neg x8, x8",
+            "dup v19.2d, x8",
+            "ldr x8, [{conditions}, #32]",
+            "neg x8, x8",
+            "dup v20.2d, x8",
+            "ldr x8, [{conditions}, #40]",
+            "neg x8, x8",
+            "dup v21.2d, x8",
+            "ldr x8, [{conditions}, #48]",
+            "neg x8, x8",
+            "dup v22.2d, x8",
+            "ldr x8, [{conditions}, #56]",
+            "neg x8, x8",
+            "dup v23.2d, x8",
+            "mov x9, {destinations}",
+            "mov x10, {source}",
+            "mov x11, {remaining}",
+            "mov x12, {stride_bytes}",
+            "cmp x11, #4",
+            "b.lo 3f",
+            "2:",
+            "ldp q0, q1, [x10], #32",
+            "mov x13, x9",
+            compact_xor_row_pair!("v16"),
+            compact_xor_row_pair!("v17"),
+            compact_xor_row_pair!("v18"),
+            compact_xor_row_pair!("v19"),
+            compact_xor_row_pair!("v20"),
+            compact_xor_row_pair!("v21"),
+            compact_xor_row_pair!("v22"),
+            compact_xor_row_pair!("v23"),
+            "add x9, x9, #32",
+            "sub x11, x11, #4",
+            "cmp x11, #4",
+            "b.hs 2b",
+            "3:",
+            "cmp x11, #2",
+            "b.lo 4f",
+            "ldr q0, [x10], #16",
+            "mov x13, x9",
+            compact_xor_row_one!("v16"),
+            compact_xor_row_one!("v17"),
+            compact_xor_row_one!("v18"),
+            compact_xor_row_one!("v19"),
+            compact_xor_row_one!("v20"),
+            compact_xor_row_one!("v21"),
+            compact_xor_row_one!("v22"),
+            compact_xor_row_one!("v23"),
+            "add x9, x9, #16",
+            "sub x11, x11, #2",
+            "4:",
+            "cbz x11, 5f",
+            "ldr x8, [x10]",
+            "mov x13, x9",
+            compact_xor_row_scalar!("d16"),
+            compact_xor_row_scalar!("d17"),
+            compact_xor_row_scalar!("d18"),
+            compact_xor_row_scalar!("d19"),
+            compact_xor_row_scalar!("d20"),
+            compact_xor_row_scalar!("d21"),
+            compact_xor_row_scalar!("d22"),
+            compact_xor_row_scalar!("d23"),
+            "5:",
+            conditions = in(reg) conditions.as_ptr(),
+            destinations = in(reg) destinations.as_mut_ptr().add(first),
+            source = in(reg) source.as_ptr().add(first),
+            remaining = in(reg) stride - first,
+            stride_bytes = in(reg) stride * core::mem::size_of::<u64>(),
+            out("x8") _,
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            out("x12") _,
+            out("x13") _,
+            out("x14") _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            options(nostack)
+        );
+    }
+}
+
+/// XOR eight masked source rows into one destination using only caller-saved registers.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn xor_eight_sources_if_compact(
+    destination: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: [u64; 8],
+) {
+    use core::arch::asm;
+
+    debug_assert_eq!(destination.len(), stride);
+    debug_assert_eq!(sources.len(), 8 * stride);
+
+    // SAFETY: `destination` and the eight complete source rows are disjoint. Adding `first`
+    // leaves `stride - first` valid words in each. Main and tail loops process four, two and
+    // one word, and every branch depends only on that public count. Conditions affect only
+    // fixed mask-and-XOR instructions, using caller-saved registers throughout.
+    unsafe {
+        asm!(
+            "ldr x8, [{conditions}, #0]",
+            "neg x8, x8",
+            "dup v16.2d, x8",
+            "ldr x8, [{conditions}, #8]",
+            "neg x8, x8",
+            "dup v17.2d, x8",
+            "ldr x8, [{conditions}, #16]",
+            "neg x8, x8",
+            "dup v18.2d, x8",
+            "ldr x8, [{conditions}, #24]",
+            "neg x8, x8",
+            "dup v19.2d, x8",
+            "ldr x8, [{conditions}, #32]",
+            "neg x8, x8",
+            "dup v20.2d, x8",
+            "ldr x8, [{conditions}, #40]",
+            "neg x8, x8",
+            "dup v21.2d, x8",
+            "ldr x8, [{conditions}, #48]",
+            "neg x8, x8",
+            "dup v22.2d, x8",
+            "ldr x8, [{conditions}, #56]",
+            "neg x8, x8",
+            "dup v23.2d, x8",
+            "mov x9, {destination}",
+            "mov x10, {sources}",
+            "mov x11, {remaining}",
+            "mov x12, {stride_bytes}",
+            "cmp x11, #4",
+            "b.lo 3f",
+            "2:",
+            "ldp q0, q1, [x9]",
+            "mov x13, x10",
+            compact_xor_source_pair!("v16"),
+            compact_xor_source_pair!("v17"),
+            compact_xor_source_pair!("v18"),
+            compact_xor_source_pair!("v19"),
+            compact_xor_source_pair!("v20"),
+            compact_xor_source_pair!("v21"),
+            compact_xor_source_pair!("v22"),
+            compact_xor_source_pair!("v23"),
+            "stp q0, q1, [x9], #32",
+            "add x10, x10, #32",
+            "sub x11, x11, #4",
+            "cmp x11, #4",
+            "b.hs 2b",
+            "3:",
+            "cmp x11, #2",
+            "b.lo 4f",
+            "ldr q0, [x9]",
+            "mov x13, x10",
+            compact_xor_source_one!("v16"),
+            compact_xor_source_one!("v17"),
+            compact_xor_source_one!("v18"),
+            compact_xor_source_one!("v19"),
+            compact_xor_source_one!("v20"),
+            compact_xor_source_one!("v21"),
+            compact_xor_source_one!("v22"),
+            compact_xor_source_one!("v23"),
+            "str q0, [x9], #16",
+            "add x10, x10, #16",
+            "sub x11, x11, #2",
+            "4:",
+            "cbz x11, 5f",
+            "ldr x8, [x9]",
+            "mov x13, x10",
+            compact_xor_source_scalar!("d16"),
+            compact_xor_source_scalar!("d17"),
+            compact_xor_source_scalar!("d18"),
+            compact_xor_source_scalar!("d19"),
+            compact_xor_source_scalar!("d20"),
+            compact_xor_source_scalar!("d21"),
+            compact_xor_source_scalar!("d22"),
+            compact_xor_source_scalar!("d23"),
+            "str x8, [x9]",
+            "5:",
+            conditions = in(reg) conditions.as_ptr(),
+            destination = in(reg) destination.as_mut_ptr().add(first),
+            sources = in(reg) sources.as_ptr().add(first),
+            remaining = in(reg) stride - first,
+            stride_bytes = in(reg) stride * core::mem::size_of::<u64>(),
+            out("x8") _,
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            out("x12") _,
+            out("x13") _,
+            out("x14") _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            options(nostack)
+        );
+    }
+}
+
+/// XOR sixteen masked source rows into one destination using caller-saved registers.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn xor_sixteen_sources_if_compact(
+    destination: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: [u64; 16],
+) {
+    use core::arch::asm;
+
+    debug_assert_eq!(destination.len(), stride);
+    debug_assert_eq!(sources.len(), 16 * stride);
+
+    // SAFETY: `destination` and the sixteen complete source rows are disjoint. Adding `first`
+    // leaves `stride - first` valid words in each. Main and tail loops process four, two and
+    // one word, and every branch depends only on that public count. The sixteen conditions
+    // occupy the caller-saved `v16..v31` registers and affect only fixed mask-and-XOR
+    // instructions.
+    unsafe {
+        asm!(
+            "ldr x8, [{conditions}, #0]",
+            "neg x8, x8",
+            "dup v16.2d, x8",
+            "ldr x8, [{conditions}, #8]",
+            "neg x8, x8",
+            "dup v17.2d, x8",
+            "ldr x8, [{conditions}, #16]",
+            "neg x8, x8",
+            "dup v18.2d, x8",
+            "ldr x8, [{conditions}, #24]",
+            "neg x8, x8",
+            "dup v19.2d, x8",
+            "ldr x8, [{conditions}, #32]",
+            "neg x8, x8",
+            "dup v20.2d, x8",
+            "ldr x8, [{conditions}, #40]",
+            "neg x8, x8",
+            "dup v21.2d, x8",
+            "ldr x8, [{conditions}, #48]",
+            "neg x8, x8",
+            "dup v22.2d, x8",
+            "ldr x8, [{conditions}, #56]",
+            "neg x8, x8",
+            "dup v23.2d, x8",
+            "ldr x8, [{conditions}, #64]",
+            "neg x8, x8",
+            "dup v24.2d, x8",
+            "ldr x8, [{conditions}, #72]",
+            "neg x8, x8",
+            "dup v25.2d, x8",
+            "ldr x8, [{conditions}, #80]",
+            "neg x8, x8",
+            "dup v26.2d, x8",
+            "ldr x8, [{conditions}, #88]",
+            "neg x8, x8",
+            "dup v27.2d, x8",
+            "ldr x8, [{conditions}, #96]",
+            "neg x8, x8",
+            "dup v28.2d, x8",
+            "ldr x8, [{conditions}, #104]",
+            "neg x8, x8",
+            "dup v29.2d, x8",
+            "ldr x8, [{conditions}, #112]",
+            "neg x8, x8",
+            "dup v30.2d, x8",
+            "ldr x8, [{conditions}, #120]",
+            "neg x8, x8",
+            "dup v31.2d, x8",
+            "mov x9, {destination}",
+            "mov x10, {sources}",
+            "mov x11, {remaining}",
+            "mov x12, {stride_bytes}",
+            "cmp x11, #4",
+            "b.lo 3f",
+            "2:",
+            "ldp q0, q1, [x9]",
+            "mov x13, x10",
+            compact_xor_source_pair!("v16"),
+            compact_xor_source_pair!("v17"),
+            compact_xor_source_pair!("v18"),
+            compact_xor_source_pair!("v19"),
+            compact_xor_source_pair!("v20"),
+            compact_xor_source_pair!("v21"),
+            compact_xor_source_pair!("v22"),
+            compact_xor_source_pair!("v23"),
+            compact_xor_source_pair!("v24"),
+            compact_xor_source_pair!("v25"),
+            compact_xor_source_pair!("v26"),
+            compact_xor_source_pair!("v27"),
+            compact_xor_source_pair!("v28"),
+            compact_xor_source_pair!("v29"),
+            compact_xor_source_pair!("v30"),
+            compact_xor_source_pair!("v31"),
+            "stp q0, q1, [x9], #32",
+            "add x10, x10, #32",
+            "sub x11, x11, #4",
+            "cmp x11, #4",
+            "b.hs 2b",
+            "3:",
+            "cmp x11, #2",
+            "b.lo 4f",
+            "ldr q0, [x9]",
+            "mov x13, x10",
+            compact_xor_source_one!("v16"),
+            compact_xor_source_one!("v17"),
+            compact_xor_source_one!("v18"),
+            compact_xor_source_one!("v19"),
+            compact_xor_source_one!("v20"),
+            compact_xor_source_one!("v21"),
+            compact_xor_source_one!("v22"),
+            compact_xor_source_one!("v23"),
+            compact_xor_source_one!("v24"),
+            compact_xor_source_one!("v25"),
+            compact_xor_source_one!("v26"),
+            compact_xor_source_one!("v27"),
+            compact_xor_source_one!("v28"),
+            compact_xor_source_one!("v29"),
+            compact_xor_source_one!("v30"),
+            compact_xor_source_one!("v31"),
+            "str q0, [x9], #16",
+            "add x10, x10, #16",
+            "sub x11, x11, #2",
+            "4:",
+            "cbz x11, 5f",
+            "ldr x8, [x9]",
+            "mov x13, x10",
+            compact_xor_source_scalar!("d16"),
+            compact_xor_source_scalar!("d17"),
+            compact_xor_source_scalar!("d18"),
+            compact_xor_source_scalar!("d19"),
+            compact_xor_source_scalar!("d20"),
+            compact_xor_source_scalar!("d21"),
+            compact_xor_source_scalar!("d22"),
+            compact_xor_source_scalar!("d23"),
+            compact_xor_source_scalar!("d24"),
+            compact_xor_source_scalar!("d25"),
+            compact_xor_source_scalar!("d26"),
+            compact_xor_source_scalar!("d27"),
+            compact_xor_source_scalar!("d28"),
+            compact_xor_source_scalar!("d29"),
+            compact_xor_source_scalar!("d30"),
+            compact_xor_source_scalar!("d31"),
+            "str x8, [x9]",
+            "5:",
+            conditions = in(reg) conditions.as_ptr(),
+            destination = in(reg) destination.as_mut_ptr().add(first),
+            sources = in(reg) sources.as_ptr().add(first),
+            remaining = in(reg) stride - first,
+            stride_bytes = in(reg) stride * core::mem::size_of::<u64>(),
+            out("x8") _,
+            out("x9") _,
+            out("x10") _,
+            out("x11") _,
+            out("x12") _,
+            out("x13") _,
+            out("x14") _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v16") _,
+            out("v17") _,
+            out("v18") _,
+            out("v19") _,
+            out("v20") _,
+            out("v21") _,
+            out("v22") _,
+            out("v23") _,
+            out("v24") _,
+            out("v25") _,
+            out("v26") _,
+            out("v27") _,
+            out("v28") _,
+            out("v29") _,
+            out("v30") _,
+            out("v31") _,
+            options(nostack)
+        );
+    }
+}
+
+#[inline]
+fn accumulate_rows(
+    target: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    pivot_word: usize,
+    pivot_shift: usize,
+    first: usize,
+) {
+    let mut target_bit = (target[pivot_word] >> pivot_shift) & 1;
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let grouped = sources.len() / (8 * stride) * (8 * stride);
+        let (groups, remainder) = sources.split_at(grouped);
+        for group in groups.chunks_exact(8 * stride) {
+            let source_bits = [
+                (group[pivot_word] >> pivot_shift) & 1,
+                (group[stride + pivot_word] >> pivot_shift) & 1,
+                (group[2 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[3 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[4 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[5 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[6 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[7 * stride + pivot_word] >> pivot_shift) & 1,
+            ];
+            let mut conditions = [0u64; 8];
+            for i in 0..8 {
+                conditions[i] = target_bit ^ source_bits[i];
+                target_bit |= source_bits[i];
+            }
+            xor_eight_sources_if_compact(target, group, stride, first, conditions);
+        }
+        for source in remainder.chunks_exact(stride) {
+            let source_bit = (source[pivot_word] >> pivot_shift) & 1;
+            xor_row_if(
+                &mut target[first..],
+                &source[first..],
+                target_bit ^ source_bit,
+            );
+            target_bit |= source_bit;
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for source in sources.chunks_exact(stride) {
+        let source_bit = (source[pivot_word] >> pivot_shift) & 1;
+        xor_row_if(
+            &mut target[first..],
+            &source[first..],
+            target_bit ^ source_bit,
+        );
+        target_bit |= source_bit;
+    }
+}
+
+#[inline]
+fn clear_rows(
+    targets: &mut [u64],
+    source: &[u64],
+    stride: usize,
+    pivot_word: usize,
+    pivot_shift: usize,
+    first: usize,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let grouped = targets.len() / (8 * stride) * (8 * stride);
+        let (groups, remainder) = targets.split_at_mut(grouped);
+        for group in groups.chunks_exact_mut(8 * stride) {
+            let conditions = [
+                (group[pivot_word] >> pivot_shift) & 1,
+                (group[stride + pivot_word] >> pivot_shift) & 1,
+                (group[2 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[3 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[4 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[5 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[6 * stride + pivot_word] >> pivot_shift) & 1,
+                (group[7 * stride + pivot_word] >> pivot_shift) & 1,
+            ];
+            xor_eight_rows_if_compact(group, source, stride, first, conditions);
+        }
+        for target in remainder.chunks_exact_mut(stride) {
+            let condition = (target[pivot_word] >> pivot_shift) & 1;
+            xor_row_if(&mut target[first..], &source[first..], condition);
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for target in targets.chunks_exact_mut(stride) {
+        let condition = (target[pivot_word] >> pivot_shift) & 1;
+        xor_row_if(&mut target[first..], &source[first..], condition);
+    }
+}
+
 impl BitMatrix {
     /// Allocate a zeroed matrix with `rows` rows and at least `columns` columns.
     pub(crate) fn zeros(rows: usize, columns: usize) -> Self {
@@ -81,6 +784,7 @@ impl BitMatrix {
     /// `first` lets the caller skip the leading words that elimination has already reduced to
     /// zero in both rows; it depends only on how far the elimination has progressed, never on
     /// the contents of the matrix, so skipping them is not a data-dependent shortcut.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn add_row(&mut self, target: usize, source: usize, mask: u64, first: usize) {
         debug_assert_ne!(target, source);
@@ -101,6 +805,137 @@ impl BitMatrix {
         for (dest, &src) in target_words.iter_mut().zip(source_words.iter()) {
             *dest ^= src & mask;
         }
+    }
+
+    /// Fold every row below `row` into it until its `pivot` bit is one, using masked additions.
+    ///
+    /// The loop bounds and memory locations depend only on the public matrix dimensions and
+    /// elimination position. Keeping the target row borrowed once avoids splitting and
+    /// rechecking the matrix allocation for every candidate pivot row.
+    #[inline]
+    pub(crate) fn accumulate_pivot(&mut self, row: usize, pivot: usize, first: usize) {
+        let stride = self.stride;
+        let row_start = row * stride;
+        let (_, target_and_after) = self.data.split_at_mut(row_start);
+        let (target, after) = target_and_after.split_at_mut(stride);
+        let pivot_word = pivot / 64;
+        let pivot_shift = pivot % 64;
+
+        accumulate_rows(target, after, stride, pivot_word, pivot_shift, first);
+    }
+
+    /// Clear `pivot` from every row below `row`, using `row` as the source.
+    ///
+    /// Forward elimination only needs the rows below the pivot in echelon form. Rows above it
+    /// are reduced later in blocks, which lets eight pivot rows share one destination pass.
+    #[inline]
+    pub(crate) fn clear_below(&mut self, row: usize, pivot: usize, first: usize) {
+        let stride = self.stride;
+        let row_start = row * stride;
+        let (_, source_and_after) = self.data.split_at_mut(row_start);
+        let (source, after) = source_and_after.split_at_mut(stride);
+        let pivot_word = pivot / 64;
+        let pivot_shift = pivot % 64;
+
+        clear_rows(after, source, stride, pivot_word, pivot_shift, first);
+    }
+
+    /// Back-substitute a block of at most sixteen consecutive pivot rows.
+    ///
+    /// The pivot rows first reduce each other to an identity block. On AArch64, a full block
+    /// then clears all sixteen pivot columns from each earlier row in one streaming pass. The
+    /// sequence of rows, loads and stores depends only on the public matrix dimensions.
+    #[inline]
+    pub(crate) fn clear_above_block<const COUNT: usize>(&mut self, start: usize) {
+        let count = COUNT;
+        debug_assert!(count > 0 && count <= 16);
+        debug_assert!(start + count <= self.rows);
+
+        let stride = self.stride;
+        let first = start / 64;
+
+        // Make the pivot rows an identity block. Forward elimination already cleared every
+        // earlier pivot from each later row, so only entries above the diagonal remain.
+        for source_row in (start..start + count).rev() {
+            let source_start = source_row * stride;
+            let (before_source, source_and_after) = self.data.split_at_mut(source_start);
+            let source = &source_and_after[..stride];
+            let targets = &mut before_source[start * stride..source_start];
+            clear_rows(
+                targets,
+                source,
+                stride,
+                source_row / 64,
+                source_row % 64,
+                first,
+            );
+        }
+
+        let block_start = start * stride;
+        let (before, block_and_after) = self.data.split_at_mut(block_start);
+        let block = &block_and_after[..count * stride];
+
+        #[cfg(target_arch = "aarch64")]
+        if count == 16 {
+            for target in before.chunks_exact_mut(stride) {
+                let mut conditions = [0u64; 16];
+                for (offset, condition) in conditions.iter_mut().enumerate() {
+                    let pivot = start + offset;
+                    *condition = (target[pivot / 64] >> (pivot % 64)) & 1;
+                }
+                xor_sixteen_sources_if_compact(target, block, stride, first, conditions);
+            }
+            return;
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if count == 8 {
+            for target in before.chunks_exact_mut(stride) {
+                let conditions = [
+                    (target[start / 64] >> (start % 64)) & 1,
+                    (target[(start + 1) / 64] >> ((start + 1) % 64)) & 1,
+                    (target[(start + 2) / 64] >> ((start + 2) % 64)) & 1,
+                    (target[(start + 3) / 64] >> ((start + 3) % 64)) & 1,
+                    (target[(start + 4) / 64] >> ((start + 4) % 64)) & 1,
+                    (target[(start + 5) / 64] >> ((start + 5) % 64)) & 1,
+                    (target[(start + 6) / 64] >> ((start + 6) % 64)) & 1,
+                    (target[(start + 7) / 64] >> ((start + 7) % 64)) & 1,
+                ];
+                xor_eight_sources_if_compact(target, block, stride, first, conditions);
+            }
+            return;
+        }
+
+        // Portable path and the one short block possible when the row count is not a multiple
+        // of sixteen. The fixed source order is still data oblivious.
+        for (offset, source) in block.chunks_exact(stride).enumerate().rev() {
+            clear_rows(
+                before,
+                source,
+                stride,
+                (start + offset) / 64,
+                (start + offset) % 64,
+                first,
+            );
+        }
+    }
+
+    /// Clear `pivot` from every row except `row`, using `row` as the source.
+    ///
+    /// Borrowing the source once lets the two contiguous target ranges stream through memory
+    /// without re-splitting the allocation for every row.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn clear_column(&mut self, row: usize, pivot: usize, first: usize) {
+        let stride = self.stride;
+        let row_start = row * stride;
+        let (before, source_and_after) = self.data.split_at_mut(row_start);
+        let (source, after) = source_and_after.split_at_mut(stride);
+        let pivot_word = pivot / 64;
+        let pivot_shift = pivot % 64;
+
+        clear_rows(before, source, stride, pivot_word, pivot_shift, first);
+        clear_rows(after, source, stride, pivot_word, pivot_shift, first);
     }
 
     /// Extract `count` bits of `row` starting at `start`, packed little-endian into `out`.
@@ -236,6 +1071,62 @@ mod tests {
                 let t = (rows[target][bit / 8] >> (bit % 8)) & 1;
                 let s = (rows[source][bit / 8] >> (bit % 8)) & 1;
                 assert_eq!(m.bit(target, bit), (t ^ s) as u64, "bit {bit}");
+            }
+        }
+    }
+
+    #[test]
+    fn pivot_sweeps_match_individual_row_additions() {
+        let mut rng = Rng(0xF00D_CAFE_1357_2468);
+        let rows = 17;
+        let columns = 320;
+        let bytes: Vec<Vec<u8>> = (0..rows)
+            .map(|_| (0..columns / 8).map(|_| rng.next() as u8).collect())
+            .collect();
+
+        for row in [0usize, 5, rows - 1] {
+            let pivot = 67 + row;
+            let first = pivot / 64;
+            let mut expected = BitMatrix::zeros(rows, columns);
+            let mut actual = BitMatrix::zeros(rows, columns);
+            for (i, value) in bytes.iter().enumerate() {
+                fill_row(&mut expected, i, value);
+                fill_row(&mut actual, i, value);
+            }
+
+            for source in row + 1..rows {
+                let mask =
+                    0u64.wrapping_sub(expected.bit(row, pivot) ^ expected.bit(source, pivot));
+                expected.add_row(row, source, mask, first);
+            }
+            actual.accumulate_pivot(row, pivot, first);
+
+            for target in 0..rows {
+                for bit in 0..columns {
+                    assert_eq!(
+                        actual.bit(target, bit),
+                        expected.bit(target, bit),
+                        "accumulate row {row} target {target} bit {bit}"
+                    );
+                }
+            }
+
+            for target in 0..rows {
+                if target != row {
+                    let mask = 0u64.wrapping_sub(expected.bit(target, pivot));
+                    expected.add_row(target, row, mask, first);
+                }
+            }
+            actual.clear_column(row, pivot, first);
+
+            for target in 0..rows {
+                for bit in 0..columns {
+                    assert_eq!(
+                        actual.bit(target, bit),
+                        expected.bit(target, bit),
+                        "clear row {row} target {target} bit {bit}"
+                    );
+                }
             }
         }
     }

@@ -5,9 +5,11 @@
 //! Encapsulation: `FixedWeight`, `Encode` and the session-key hash.
 
 use rand_core::CryptoRng;
+use zeroize::Zeroizing;
 
 use super::hash::{HASH_ENCAPSULATION, HASH_PLAINTEXT_CONFIRMATION, hash_32};
 use super::params::Params;
+use super::sort::sort_u16;
 
 /// All ones when `x == y`, all zeros otherwise.
 #[inline]
@@ -42,8 +44,8 @@ pub(crate) fn public_key_padding_is_zero<P: Params>(pk: &[u8]) -> bool {
 pub(crate) fn fixed_weight<P: Params>(e: &mut [u8], mut rng: impl CryptoRng) {
     debug_assert_eq!(e.len(), P::N_BYTES);
 
-    let mut bytes = vec![0u8; P::TAU * 2];
-    let mut indices = vec![0u16; P::T];
+    let mut bytes = Zeroizing::new(vec![0u8; P::TAU * 2]);
+    let mut indices = Zeroizing::new(vec![0u16; P::T]);
 
     loop {
         rng.fill_bytes(&mut bytes);
@@ -63,13 +65,13 @@ pub(crate) fn fixed_weight<P: Params>(e: &mut [u8], mut rng: impl CryptoRng) {
             continue;
         }
 
-        // Compare every pair; an early exit would leak which pair collided.
+        // A data-oblivious sorting network brings duplicates together in O(t log^2 t)
+        // branch-free comparisons instead of comparing all O(t^2) pairs.
+        sort_u16(&mut indices[..P::T]);
         let mut repeated = 0u16;
         for i in 1..P::T {
-            for j in 0..i {
-                let equal = ((indices[i] ^ indices[j]) as u32).wrapping_sub(1) >> 31;
-                repeated |= equal as u16;
-            }
+            let equal = ((indices[i] ^ indices[i - 1]) as u32).wrapping_sub(1) >> 31;
+            repeated |= equal as u16;
         }
         if repeated == 0 {
             break;
@@ -79,13 +81,11 @@ pub(crate) fn fixed_weight<P: Params>(e: &mut [u8], mut rng: impl CryptoRng) {
     // Setting the chosen bits has to touch every position for every index, or which byte an
     // index landed in would leak. Comparing a whole word at a time rather than a byte at a
     // time does that in an eighth of the comparisons.
-    let bits: Vec<u64> = indices.iter().map(|&index| 1u64 << (index & 63)).collect();
-    let homes: Vec<u16> = indices.iter().map(|&index| index >> 6).collect();
-
     for (w, chunk) in e.chunks_mut(8).enumerate() {
         let mut word = 0u64;
-        for (&bit, &home) in bits.iter().zip(homes.iter()) {
-            word |= bit & same_mask(w as u16, home);
+        for &index in &indices[..P::T] {
+            let bit = 1u64 << (index & 63);
+            word |= bit & same_mask(w as u16, index >> 6);
         }
         let bytes = word.to_le_bytes();
         chunk.copy_from_slice(&bytes[..chunk.len()]);
@@ -106,32 +106,34 @@ pub(crate) fn encode<P: Params>(syndrome: &mut [u8], pk: &[u8], e: &[u8]) {
     // The trailing `k` bits of `e`, aligned to the start of a word so it lines up with a
     // public key row. Bits past `k` in the final word stay zero.
     let words = P::PK_ROW_BYTES.div_ceil(8);
-    let mut tail = vec![0u64; words];
+    let mut tail = Zeroizing::new(vec![0u64; words]);
     let shift = P::PK_NROWS % 8;
     let first = P::PK_NROWS / 8;
     for (w, word) in tail.iter_mut().enumerate() {
-        let mut buf = [0u8; 8];
-        for (b, slot) in buf.iter_mut().enumerate() {
+        let mut packed = 0u64;
+        for b in 0..8 {
             let at = first + w * 8 + b;
             let low = if at < P::N_BYTES { e[at] } else { 0 };
-            *slot = if shift == 0 {
+            let byte = if shift == 0 {
                 low
             } else {
                 let high = if at + 1 < P::N_BYTES { e[at + 1] } else { 0 };
                 (low >> shift) | (high << (8 - shift))
             };
+            packed |= u64::from(byte) << (b * 8);
         }
-        *word = u64::from_le_bytes(buf);
+        *word = packed;
     }
     let spare = words * 64 - P::PK_NCOLS;
     if spare > 0 {
         tail[words - 1] &= u64::MAX >> spare;
     }
 
-    syndrome.fill(0);
-    for i in 0..P::PK_NROWS {
-        let row = &pk[i * P::PK_ROW_BYTES..(i + 1) * P::PK_ROW_BYTES];
-
+    syndrome.copy_from_slice(&e[..P::SYND_BYTES]);
+    if P::PK_NROWS % 8 != 0 {
+        syndrome[P::SYND_BYTES - 1] &= (1u8 << (P::PK_NROWS % 8)) - 1;
+    }
+    for (i, row) in pk.chunks_exact(P::PK_ROW_BYTES).enumerate() {
         // Each whole word of the row is a fixed eight-byte copy, which compiles to one load.
         // Deriving the length per word instead, as a `min` against what is left of the row,
         // turns every one of them into a variable-length copy and costs an order of magnitude.
@@ -152,8 +154,8 @@ pub(crate) fn encode<P: Params>(syndrome: &mut [u8], pk: &[u8], e: &[u8]) {
             acc ^= u64::from_le_bytes(buf) & tail[words - 1];
         }
 
-        let bit = (acc.count_ones() as u8 & 1) ^ ((e[i / 8] >> (i % 8)) & 1);
-        syndrome[i / 8] |= bit << (i % 8);
+        let bit = acc.count_ones() as u8 & 1;
+        syndrome[i / 8] ^= bit << (i % 8);
     }
 }
 
@@ -173,7 +175,7 @@ pub(crate) fn encapsulate<P: Params>(
 
     let padding_ok = public_key_padding_is_zero::<P>(pk);
 
-    let mut e = vec![0u8; P::N_BYTES];
+    let mut e = Zeroizing::new(vec![0u8; P::N_BYTES]);
     fixed_weight::<P>(&mut e, rng);
 
     let (c0, c1) = ciphertext.split_at_mut(P::SYND_BYTES);
@@ -184,9 +186,6 @@ pub(crate) fn encapsulate<P: Params>(
     }
 
     hash_32(HASH_ENCAPSULATION, &e, ciphertext, session_key);
-
-    use zeroize::Zeroize;
-    e.zeroize();
 
     let mask = if padding_ok { 0xFFu8 } else { 0x00 };
     for byte in ciphertext.iter_mut() {

@@ -4,16 +4,15 @@
 */
 //! Bit-sliced arithmetic over `F_q`.
 //!
-//! A slice holds 64 field elements as `m` words: word `i` carries bit `i` of every element, one
+//! A slice holds 128 field elements as `m` words: word `i` carries bit `i` of every element, one
 //! per lane. Arithmetic then becomes bitwise operations on whole words, so a single
-//! multiplication instruction sequence serves all 64 lanes at once.
+//! multiplication instruction sequence serves the entire group at once.
 //!
-//! The reference implementations hardcode the squaring and reduction formulas for one field.
-//! Here both are derived from the scalar [`Field`] at start-up: squaring and multiplication by
-//! a fixed element are `F_2`-linear maps, so each is fully described by where it sends the
-//! basis `1, z, ..., z^(m-1)`, which the scalar implementation can simply be asked for.
+//! Reduction and squaring use the fixed formulas for the two standardized fields. Exposing
+//! those sparse formulas directly lets the compiler keep the bit-planes in registers instead
+//! of routing them through runtime index tables.
 //!
-//! # Why this is not wired into the decoder yet
+//! # Why the decoder keeps polynomials bit-sliced
 //!
 //! Measured against the scalar multiplier on an Apple M-series core, with both loops given
 //! enough independent work to run at throughput rather than latency:
@@ -25,10 +24,9 @@
 //! | bit-sliced, 128-bit lanes | 0.58 | 4.88x |
 //!
 //! A hardware carry-less multiply is already good, so 64-bit bit-slicing on its own wins too
-//! little to pay for converting in and out of this representation. The gain comes from the
-//! register width, and it scales close to linearly. Wiring this in is therefore worth doing
-//! together with wide lanes and with the whole decoder kept in bit-sliced form, so that no
-//! conversion happens on the hot path, rather than on its own.
+//! little to pay for converting in and out of this representation. The decoder therefore uses
+//! wide lanes and keeps the Berlekamp--Massey polynomial bit-sliced throughout its update loop,
+//! so conversion happens only at the boundary.
 
 use super::field::Field;
 
@@ -52,34 +50,72 @@ pub(crate) const LANES: usize = Word::BITS as usize;
 /// array serves both field widths.
 pub(crate) type Slice = [Word; MAX_BITS];
 
-/// Tables describing a field's `F_2`-linear maps, built once and reused.
+/// A narrow bit-sliced group used by the degree-64 Berlekamp--Massey specialization.
+#[cfg(feature = "decapsulate")]
+pub(crate) type Slice64 = [u64; MAX_BITS];
+
+/// Bit-sliced arithmetic selected by field type.
 pub(crate) struct Tables<F: Field> {
-    /// `reduce[d]` is `z^(m + d)` reduced into the field, for folding a product's high half.
-    reduce: [u16; MAX_BITS],
-    /// `square[j]` is `z^(2j)` reduced into the field.
-    square: [u16; MAX_BITS],
     field: core::marker::PhantomData<F>,
 }
 
+macro_rules! karatsuba_product {
+    ($name:ident, $word:ty, $slice:ty, $split:expr, $upper:expr) => {
+        #[inline(always)]
+        fn $name(a: &$slice, b: &$slice) -> [$word; 2 * MAX_BITS - 1] {
+            const SPLIT: usize = $split;
+            const UPPER: usize = $upper;
+
+            let mut a_sum: [$word; 7] = Default::default();
+            let mut b_sum: [$word; 7] = Default::default();
+            for i in 0..UPPER {
+                a_sum[i] = a[i] ^ a[i + SPLIT];
+                b_sum[i] = b[i] ^ b[i + SPLIT];
+            }
+            if UPPER < SPLIT {
+                a_sum[UPPER] = a[UPPER];
+                b_sum[UPPER] = b[UPPER];
+            }
+
+            let mut low: [$word; 13] = Default::default();
+            let mut middle: [$word; 13] = Default::default();
+            let mut high: [$word; 13] = Default::default();
+            for i in 0..SPLIT {
+                for j in 0..SPLIT {
+                    low[i + j] ^= a[i] & b[j];
+                    middle[i + j] ^= a_sum[i] & b_sum[j];
+                }
+            }
+            for i in 0..UPPER {
+                for j in 0..UPPER {
+                    high[i + j] ^= a[i + SPLIT] & b[j + SPLIT];
+                }
+            }
+
+            let mut product: [$word; 2 * MAX_BITS - 1] = Default::default();
+            for i in 0..2 * SPLIT - 1 {
+                product[i] ^= low[i];
+                product[i + SPLIT] ^= middle[i] ^ low[i] ^ high[i];
+            }
+            for i in 0..2 * UPPER - 1 {
+                product[i + 2 * SPLIT] ^= high[i];
+            }
+            product
+        }
+    };
+}
+
+karatsuba_product!(product12, Word, Slice, 6, 6);
+karatsuba_product!(product13, Word, Slice, 7, 6);
+#[cfg(feature = "decapsulate")]
+karatsuba_product!(product12_64, u64, Slice64, 6, 6);
+#[cfg(feature = "decapsulate")]
+karatsuba_product!(product13_64, u64, Slice64, 7, 6);
+
 impl<F: Field> Tables<F> {
-    /// Derive the tables by asking the scalar implementation where it sends each basis element.
+    /// Select the field arithmetic at compile time.
     pub(crate) fn new() -> Self {
-        let mut reduce = [0u16; MAX_BITS];
-        let mut square = [0u16; MAX_BITS];
-
-        // `z^(m + d)` is `z^d` times `z^m`, and `z^m` is what a one-bit overflow reduces to.
-        let overflow = F::reduce(1u32 << F::BITS);
-        for (d, slot) in reduce.iter_mut().take(F::BITS).enumerate() {
-            *slot = F::mul(overflow, 1u16 << d);
-        }
-
-        for (j, slot) in square.iter_mut().take(F::BITS).enumerate() {
-            *slot = F::sq(1u16 << j);
-        }
-
         Self {
-            reduce,
-            square,
             field: core::marker::PhantomData,
         }
     }
@@ -87,26 +123,70 @@ impl<F: Field> Tables<F> {
     /// Multiply two bit-sliced groups lane by lane.
     ///
     /// The schoolbook convolution gives a product of degree up to `2m - 2`; the top half folds
-    /// back in through the reduction table. Every operation is a word-wide `AND` or `XOR`, so
-    /// all 64 lanes advance together.
+    /// back through the standardized sparse field polynomial. Every operation is a word-wide
+    /// `AND` or `XOR`, so
+    /// all [`LANES`] lanes advance together.
     pub(crate) fn mul(&self, out: &mut Slice, a: &Slice, b: &Slice) {
         let bits = F::BITS;
-        let mut product = [0; 2 * MAX_BITS - 1];
+        let mut product = if F::BITS == 12 {
+            product12(a, b)
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            product13(a, b)
+        };
 
-        for (i, &ai) in a.iter().take(bits).enumerate() {
-            for (j, &bj) in b.iter().take(bits).enumerate() {
-                product[i + j] ^= ai & bj;
+        // Fold from the top so that each term is complete before it is folded. These are the
+        // two standardized field polynomials:
+        // z^12 = z^3 + 1 and z^13 = z^4 + z^3 + z + 1.
+        if F::BITS == 12 {
+            for d in (0..11).rev() {
+                let high = product[12 + d];
+                product[d + 3] ^= high;
+                product[d] ^= high;
+            }
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            for d in (0..12).rev() {
+                let high = product[13 + d];
+                product[d + 4] ^= high;
+                product[d + 3] ^= high;
+                product[d + 1] ^= high;
+                product[d] ^= high;
             }
         }
 
-        // Fold from the top so that each term is complete before it is folded.
-        for d in (0..bits - 1).rev() {
-            let high = product[bits + d];
-            let image = self.reduce[d];
-            for (i, slot) in product.iter_mut().take(bits).enumerate() {
-                if (image >> i) & 1 == 1 {
-                    *slot ^= high;
-                }
+        out[..bits].copy_from_slice(&product[..bits]);
+        out[bits..].fill(0);
+    }
+
+    /// Multiply two 64-lane bit-sliced groups lane by lane.
+    ///
+    /// Degree 64 has exactly one machine word of non-leading coefficients, so using a `u64`
+    /// avoids issuing both halves of every `u128` operation for an otherwise empty half.
+    #[cfg(feature = "decapsulate")]
+    pub(crate) fn mul64(&self, out: &mut Slice64, a: &Slice64, b: &Slice64) {
+        let bits = F::BITS;
+        let mut product = if F::BITS == 12 {
+            product12_64(a, b)
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            product13_64(a, b)
+        };
+
+        if F::BITS == 12 {
+            for d in (0..11).rev() {
+                let high = product[12 + d];
+                product[d + 3] ^= high;
+                product[d] ^= high;
+            }
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            for d in (0..12).rev() {
+                let high = product[13 + d];
+                product[d + 4] ^= high;
+                product[d + 3] ^= high;
+                product[d + 1] ^= high;
+                product[d] ^= high;
             }
         }
 
@@ -119,16 +199,36 @@ impl<F: Field> Tables<F> {
     /// Squaring is `F_2`-linear in characteristic two, so it is just a fixed exclusive-or
     /// pattern across the words with no multiplication at all.
     pub(crate) fn sq(&self, out: &mut Slice, a: &Slice) {
-        let bits = F::BITS;
         let mut result = [0; MAX_BITS];
-
-        for (j, &word) in a.iter().take(bits).enumerate() {
-            let image = self.square[j];
-            for (i, slot) in result.iter_mut().take(bits).enumerate() {
-                if (image >> i) & 1 == 1 {
-                    *slot ^= word;
-                }
-            }
+        if F::BITS == 12 {
+            result[0] = a[0] ^ a[6];
+            result[1] = a[11];
+            result[2] = a[1] ^ a[7];
+            result[3] = a[6];
+            result[4] = a[2] ^ a[8] ^ a[11];
+            result[5] = a[7];
+            result[6] = a[3] ^ a[9];
+            result[7] = a[8];
+            result[8] = a[4] ^ a[10];
+            result[9] = a[9];
+            result[10] = a[5] ^ a[11];
+            result[11] = a[10];
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            let t = a[11] ^ a[12];
+            result[0] = a[0] ^ a[11];
+            result[1] = a[7] ^ t;
+            result[2] = a[1] ^ a[7];
+            result[3] = a[8] ^ t;
+            result[4] = a[2] ^ a[7] ^ a[8] ^ t;
+            result[5] = a[7] ^ a[9];
+            result[6] = a[3] ^ a[8] ^ a[9] ^ a[12];
+            result[7] = a[8] ^ a[10];
+            result[8] = a[4] ^ a[9] ^ a[10];
+            result[9] = a[9] ^ a[11];
+            result[10] = a[5] ^ a[10] ^ a[11];
+            result[11] = a[10] ^ a[12];
+            result[12] = a[6] ^ t;
         }
 
         *out = result;
@@ -395,6 +495,46 @@ mod tests {
         assert_eq!(scaled, [0; MAX_BITS]);
     }
 
+    /// The 64-lane multiply is only reached by the degree-64 Berlekamp--Massey, which the
+    /// standardized parameter sets only ever instantiate over `GF(2^12)`, since `t = 64` occurs
+    /// only at `m = 12`. Its `GF(2^13)` path is therefore unreachable in practice and would
+    /// otherwise never be run at all, so check it here against the scalar field directly.
+    fn mul64_matches_the_scalar_field<F: Field>(seed: u64) {
+        const LANES_64: usize = u64::BITS as usize;
+
+        let mut rng = Rng(seed);
+        let tables = Tables::<F>::new();
+
+        for _ in 0..16 {
+            let left: Vec<u16> = (0..LANES_64)
+                .map(|_| (rng.next() as u16) & F::MASK)
+                .collect();
+            let right: Vec<u16> = (0..LANES_64)
+                .map(|_| (rng.next() as u16) & F::MASK)
+                .collect();
+
+            let mut a: Slice64 = [0; MAX_BITS];
+            let mut b: Slice64 = [0; MAX_BITS];
+            for (lane, (&x, &y)) in left.iter().zip(right.iter()).enumerate() {
+                for plane in 0..F::BITS {
+                    a[plane] |= u64::from((x >> plane) & 1) << lane;
+                    b[plane] |= u64::from((y >> plane) & 1) << lane;
+                }
+            }
+
+            let mut product: Slice64 = [0; MAX_BITS];
+            tables.mul64(&mut product, &a, &b);
+
+            for (lane, (&x, &y)) in left.iter().zip(right.iter()).enumerate() {
+                let mut got = 0u16;
+                for plane in (0..F::BITS).rev() {
+                    got = (got << 1) | ((product[plane] >> lane) & 1) as u16;
+                }
+                assert_eq!(got, F::mul(x, y), "lane {lane}");
+            }
+        }
+    }
+
     macro_rules! vec_tests {
         ($($feature:literal => $mod_name:ident, $field:ty, $seed:expr;)+) => {
             $(
@@ -421,6 +561,11 @@ mod tests {
                     #[test]
                     fn identities() {
                         algebraic_identities_hold::<$field>($seed ^ 2);
+                    }
+
+                    #[test]
+                    fn sixty_four_lane_multiply() {
+                        mul64_matches_the_scalar_field::<$field>($seed ^ 5);
                     }
                 }
             )+

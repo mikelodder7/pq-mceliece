@@ -38,11 +38,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-      - run: cargo build --no-default-features --features=nist
-      - run: cargo build --no-default-features --features=iso
-      - run: cargo build --no-default-features --features=pc
-      - run: cargo build --no-default-features --features=mceliece348864
+      # Parameter set groups carry no operations, so each needs one selecting explicitly.
+      - run: cargo build --no-default-features --features=nist,keygen,encapsulate,decapsulate
+      - run: cargo build --no-default-features --features=iso,keygen,encapsulate,decapsulate
+      - run: cargo build --no-default-features --features=pc,keygen,encapsulate,decapsulate
+      - run: cargo build --no-default-features --features=mceliece348864,keygen,encapsulate,decapsulate
+      # Selecting no parameter set, and selecting no operation, must each be a clear error.
       - run: cargo build --no-default-features || [ $? -eq 101 ]
+      - run: cargo build --no-default-features --features=nist || [ $? -eq 101 ]
       - run: cargo build --all-features
 
   # Every operation must build on its own, and drag in nothing the others need.
@@ -90,6 +93,27 @@ jobs:
         with:
           toolchain: stable
       - run: cargo test --all-features --release
+
+  # Every other job runs on x86-64, so nothing else compiles the AArch64 code: the NEON
+  # comparator in the sorting network, the PMULL carry-less multiply, and the compile-time
+  # guard tying the comparator's width to CHAIN_WIDTH. The two runners differ in whether the
+  # `aes` feature is on by default, which selects PMULL on macOS and the portable multiply on
+  # Linux, so both are worth building.
+  test-aarch64:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-latest
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+      - run: cargo test --all-features --release
+      - run: cargo clippy --all --all-features --all-targets -- -D warnings
 
   coverage:
     runs-on: ubuntu-latest

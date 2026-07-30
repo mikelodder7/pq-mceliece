@@ -82,6 +82,9 @@ than against itself:
   directions, for `m = 12` and `m = 13`.
 - **Control bits** by replaying the generated network over the identity permutation.
 - **Sorting networks** against the standard library sort, at many lengths.
+- **Precomputed decapsulation** by requiring a prepared key to agree with the key it came from
+  on every parameter set, both for ciphertexts that decode and for ones that are implicitly
+  rejected, where the substituted session key must still match.
 - **`Encode`** against the definition `C = He` with `H = (I | T)` built element by element.
 - **`Decode`** by recovering the exact error vector from an honestly generated syndrome, and by
   rejecting syndromes that do not correspond to a weight-`t` vector.
@@ -131,5 +134,18 @@ key generation seed, matching the reference implementation's use of `crypto_decl
   on fresh randomness that is discarded.
 - Padding checks on encapsulation keys and ciphertexts, which are public values.
 
+Precomputing the message-independent part of decapsulation does not change any of this. The
+precomputation runs the same masked operations the decoder previously ran inline, and the
+decoding that follows differs only in reading that material rather than deriving it. The
+material is a function of the decapsulation key alone and is treated as equally sensitive: it
+is zeroized on drop, kept out of the `Debug` output, and cannot be serialized.
+
 This crate has not been audited, and no formal constant-time verification has been run against
 compiled output.
+
+This source-level claim does not cover physical power or electromagnetic observation, template
+attacks, or fault injection. Published Classic McEliece attacks have targeted syndrome/FFT
+computation, Berlekamp--Massey, Goppa-polynomial loading, and Gaussian elimination under those
+physical threat models. Deployments exposed to those attackers need separately evaluated
+masking, fault detection, and platform-specific countermeasures; this crate does not currently
+provide them.

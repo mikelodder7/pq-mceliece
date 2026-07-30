@@ -4,10 +4,11 @@
 */
 //! The Gao-Mateer additive FFT.
 //!
-//! Decoding evaluates two polynomials at every element of `F_q`: the Goppa polynomial, to build
-//! the position weighting, and the error locator, to find its roots. Doing that one point at a
-//! time costs `q * t` field multiplications. The additive FFT costs about `(q/2) * m` instead,
-//! which for `mceliece8192128` is roughly eighteen times fewer.
+//! Key generation and decoding evaluate polynomials at every element of `F_q`: key generation
+//! evaluates the Goppa polynomial to build the parity-check matrix, while decoding evaluates it
+//! for position weighting and evaluates the error locator to find its roots. Doing that one
+//! point at a time costs `q * t` field multiplications. The additive FFT costs about `(q/2) * m`
+//! instead, which for `mceliece8192128` is roughly eighteen times fewer.
 //!
 //! The algorithm is the one from Gao and Mateer, *Additive Fast Fourier Transforms Over Finite
 //! Fields* (<https://www.math.clemson.edu/~sgao/papers/GM10.pdf>). Evaluating `f` over a
@@ -23,7 +24,7 @@
 //! [`eval_all`] with the standard basis `1, z, z^2, ...` therefore yields `out[a] = f(a)` with
 //! `a` read as a field element, which is the ordering the decoder wants.
 //!
-//! The decoder runs the bit-sliced forms, [`eval_all_bitrev_sliced`] and
+//! Key generation and the decoder run the bit-sliced forms, [`eval_all_bitrev_sliced`] and
 //! [`eval_transpose_bitrev_sliced`]. The scalar forms remain as the reference the bit-sliced
 //! ones are checked against, point by point and lane by lane.
 
@@ -61,6 +62,7 @@ fn taylor(g: &mut [u16]) {
 /// Transposing a product of elementary row additions reverses their order and swaps each
 /// source with its destination, so the fold runs upwards and writes the other way round, and
 /// the recursion happens before it rather than after.
+#[cfg(any(feature = "decapsulate", test))]
 fn taylor_transpose(g: &mut [u16]) {
     let n = g.len();
     if n <= 2 {
@@ -86,28 +88,84 @@ fn taylor_transpose(g: &mut [u16]) {
 /// factor and the normalized basis depend on the depth alone.
 struct Levels {
     /// The basis element each depth rescales by.
-    betas: Vec<u16>,
+    betas: [u16; MAX_BITS],
     /// The remaining basis at each depth, normalized so the rescaled element is one.
-    gammas: Vec<Vec<u16>>,
+    gammas: [[u16; MAX_BITS]; MAX_BITS],
+    /// Number of initialized transform levels.
+    count: usize,
+    /// Start of each depth's scalar rescaling powers.
+    power_starts: [usize; MAX_BITS + 1],
+    /// Powers of each level's public rescaling element.
+    powers: Vec<u16>,
+    /// Start of each depth's precomputed bit-sliced subspace sums.
+    omega_starts: [usize; MAX_BITS + 1],
+    /// Bit-sliced subspace sums, shared by every transform in one decode.
+    omegas: Vec<Slice>,
 }
 
-fn levels_for<P: Params>(count: usize, mut basis: Vec<u16>) -> Levels {
-    let mut betas = Vec::with_capacity(count);
-    let mut gammas = Vec::with_capacity(count);
+enum LevelPlan {
+    Shared(&'static Levels),
+    Owned(Box<Levels>),
+}
 
-    for _ in 0..count {
-        let beta = basis[basis.len() - 1];
+impl core::ops::Deref for LevelPlan {
+    type Target = Levels;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(levels) => levels,
+            Self::Owned(levels) => levels,
+        }
+    }
+}
+
+fn levels_for<P: Params>(count: usize, basis: &[u16]) -> Levels {
+    debug_assert!(count <= basis.len());
+    debug_assert!(basis.len() <= MAX_BITS);
+    let mut betas = [0u16; MAX_BITS];
+    let mut gammas = [[0u16; MAX_BITS]; MAX_BITS];
+    let mut current = [0u16; MAX_BITS];
+    current[..basis.len()].copy_from_slice(basis);
+    let mut current_len = basis.len();
+
+    for depth in 0..count {
+        let beta = current[current_len - 1];
         let beta_inverse = P::Field::inv(beta);
-        let gamma: Vec<u16> = basis[..basis.len() - 1]
-            .iter()
-            .map(|&b| P::Field::mul(b, beta_inverse))
-            .collect();
-        basis = gamma.iter().map(|&g| P::Field::sq(g) ^ g).collect();
-        betas.push(beta);
-        gammas.push(gamma);
+        let gamma_len = current_len - 1;
+        for i in 0..gamma_len {
+            gammas[depth][i] = P::Field::mul(current[i], beta_inverse);
+        }
+        for i in 0..gamma_len {
+            let gamma = gammas[depth][i];
+            current[i] = P::Field::sq(gamma) ^ gamma;
+        }
+        current_len = gamma_len;
+        betas[depth] = beta;
     }
 
-    Levels { betas, gammas }
+    Levels {
+        betas,
+        gammas,
+        count,
+        power_starts: [0; MAX_BITS + 1],
+        powers: Vec::new(),
+        omega_starts: [0; MAX_BITS + 1],
+        omegas: Vec::new(),
+    }
+}
+
+fn levels_with_powers<P: Params>(count: usize, basis: &[u16], length: usize) -> Levels {
+    let mut levels = levels_for::<P>(count, basis);
+    for depth in 0..count {
+        levels.power_starts[depth] = levels.powers.len();
+        let mut power = 1u16;
+        for _ in 0..length >> depth {
+            levels.powers.push(power);
+            power = P::Field::mul(power, levels.betas[depth]);
+        }
+    }
+    levels.power_starts[count] = levels.powers.len();
+    levels
 }
 
 /// Fill `prefix` so that walking `j` upwards accumulates the basis elements its bits select.
@@ -124,8 +182,71 @@ fn subspace_prefix(prefix: &mut [u16; 16], gamma: &[u16]) {
 }
 
 /// The bit-reversed evaluation basis: index `k` stands for the field element `bitrev(k)`.
-fn reversed_basis<P: Params>() -> Vec<u16> {
-    (0..P::M).map(|i| 1u16 << (P::M - 1 - i)).collect()
+fn reversed_basis<P: Params>() -> [u16; MAX_BITS] {
+    let mut basis = [0u16; MAX_BITS];
+    for (i, slot) in basis.iter_mut().take(P::M).enumerate() {
+        *slot = 1u16 << (P::M - 1 - i);
+    }
+    basis
+}
+
+/// Public constants and reusable coefficient storage shared by one decoding operation.
+pub(crate) struct TransformWorkspace {
+    levels: LevelPlan,
+    storage: Vec<u16>,
+}
+
+impl TransformWorkspace {
+    /// Allocate for the largest transform the decoder performs.
+    pub(crate) fn new<P: Params>() -> Self {
+        use std::sync::OnceLock;
+
+        static GF12_LEVELS: OnceLock<Levels> = OnceLock::new();
+        static GF13_LEVELS: OnceLock<Levels> = OnceLock::new();
+
+        let length = (2 * P::T).next_power_of_two();
+        let build = || {
+            let basis = reversed_basis::<P>();
+            let count = length.trailing_zeros() as usize;
+            let mut levels = levels_with_powers::<P>(count, &basis[..P::M], length);
+            for depth in 0..count {
+                levels.omega_starts[depth] = levels.omegas.len();
+                let gamma = &levels.gammas[depth][..P::M - depth - 1];
+                let half = P::Q >> (depth + 1);
+                let omega_count = if half >= LANES { half / LANES } else { 1 };
+                for offset in 0..omega_count {
+                    levels.omegas.push(omega_group(gamma, offset * LANES, P::M));
+                }
+            }
+            levels.omega_starts[count] = levels.omegas.len();
+            levels
+        };
+        // A user-defined `Params` implementation may also have 12 or 13 index bits. Reuse a
+        // process-wide plan only when its field has the standardized modulus that produced the
+        // cached constants; custom fields receive an owned plan.
+        let standardized_field = P::Field::BITS == P::M
+            && match P::M {
+                12 => P::Field::reduce(1 << 12) == 0b1001,
+                13 => P::Field::reduce(1 << 13) == 0b1_1011,
+                _ => false,
+            };
+        let levels = match (P::M, length, standardized_field) {
+            (12, 128, true) => LevelPlan::Shared(GF12_LEVELS.get_or_init(build)),
+            (13, 256, true) => LevelPlan::Shared(GF13_LEVELS.get_or_init(build)),
+            _ => LevelPlan::Owned(Box::new(build())),
+        };
+        Self {
+            levels,
+            storage: vec![0; 2 * length],
+        }
+    }
+}
+
+impl Drop for TransformWorkspace {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.storage.zeroize();
+    }
 }
 
 /// Evaluate `f` at every element of `F_q`, writing `out[a] = f(a)`.
@@ -135,8 +256,11 @@ fn reversed_basis<P: Params>() -> Vec<u16> {
 #[cfg(test)]
 pub(crate) fn eval_all<P: Params>(out: &mut [u16], f: &[u16]) {
     // The standard basis makes the output index equal the field element it evaluates at.
-    let basis: Vec<u16> = (0..P::M).map(|i| 1u16 << i).collect();
-    evaluate::<P>(out, f, basis);
+    let mut basis = [0u16; MAX_BITS];
+    for (i, slot) in basis.iter_mut().take(P::M).enumerate() {
+        *slot = 1u16 << i;
+    }
+    evaluate::<P>(out, f, &basis[..P::M]);
 }
 
 /// Evaluate `f` at every element of `F_q`, writing `out[k] = f(bitrev(k))`.
@@ -147,28 +271,32 @@ pub(crate) fn eval_all<P: Params>(out: &mut [u16], f: &[u16]) {
 /// secret-dependent lookup.
 #[cfg(test)]
 pub(crate) fn eval_all_bitrev<P: Params>(out: &mut [u16], f: &[u16]) {
-    evaluate::<P>(out, f, reversed_basis::<P>());
+    let basis = reversed_basis::<P>();
+    evaluate::<P>(out, f, &basis[..P::M]);
 }
 
 /// Rescale, rewrite in powers of tau, and split even from odd digits, once per level.
 ///
 /// After `levels` rounds each entry is the constant that one leaf of the recursion would see.
-fn coefficient_pass<P: Params>(coefficients: &mut [u16], plan: &Levels, levels: usize) {
+fn coefficient_pass<P: Params>(
+    coefficients: &mut [u16],
+    scratch: &mut [u16],
+    plan: &Levels,
+    levels: usize,
+) {
     let length = coefficients.len();
-    let mut scratch = vec![0u16; length];
+    debug_assert_eq!(scratch.len(), length);
 
     for depth in 0..levels {
-        let beta = plan.betas[depth];
         let block = length >> depth;
         let half = block / 2;
 
         for start in (0..length).step_by(block) {
             let segment = &mut coefficients[start..start + block];
 
-            let mut power = 1u16;
-            for coefficient in segment.iter_mut() {
+            let powers = &plan.powers[plan.power_starts[depth]..plan.power_starts[depth] + block];
+            for (coefficient, &power) in segment.iter_mut().zip(powers.iter()) {
                 *coefficient = P::Field::mul(*coefficient, power);
-                power = P::Field::mul(power, beta);
             }
 
             taylor(segment);
@@ -184,12 +312,17 @@ fn coefficient_pass<P: Params>(coefficients: &mut [u16], plan: &Levels, levels: 
 
 /// The transpose of [`coefficient_pass`]: the level order reverses, the even-odd split becomes
 /// an interleave, and the Taylor step runs backwards. Rescaling is diagonal and self-transposed.
-fn coefficient_pass_transpose<P: Params>(coefficients: &mut [u16], plan: &Levels, levels: usize) {
+#[cfg(any(feature = "decapsulate", test))]
+fn coefficient_pass_transpose<P: Params>(
+    coefficients: &mut [u16],
+    scratch: &mut [u16],
+    plan: &Levels,
+    levels: usize,
+) {
     let length = coefficients.len();
-    let mut scratch = vec![0u16; length];
+    debug_assert_eq!(scratch.len(), length);
 
     for depth in (0..levels).rev() {
-        let beta = plan.betas[depth];
         let block = length >> depth;
         let half = block / 2;
 
@@ -204,10 +337,9 @@ fn coefficient_pass_transpose<P: Params>(coefficients: &mut [u16], plan: &Levels
 
             taylor_transpose(segment);
 
-            let mut power = 1u16;
-            for coefficient in segment.iter_mut() {
+            let powers = &plan.powers[plan.power_starts[depth]..plan.power_starts[depth] + block];
+            for (coefficient, &power) in segment.iter_mut().zip(powers.iter()) {
                 *coefficient = P::Field::mul(*coefficient, power);
-                power = P::Field::mul(power, beta);
             }
         }
     }
@@ -219,17 +351,18 @@ fn coefficient_pass_transpose<P: Params>(coefficients: &mut [u16], plan: &Levels
 /// The transform is written as two flat passes rather than as a recursion, since all the
 /// per-node quantities a recursion would recompute are really per-level constants.
 #[cfg(test)]
-fn evaluate<P: Params>(out: &mut [u16], f: &[u16], basis: Vec<u16>) {
+fn evaluate<P: Params>(out: &mut [u16], f: &[u16], basis: &[u16]) {
     debug_assert_eq!(out.len(), P::Q);
 
     let length = f.len().next_power_of_two();
     let levels = length.trailing_zeros() as usize;
     debug_assert!(levels <= P::M);
-    let plan = levels_for::<P>(levels, basis);
+    let plan = levels_with_powers::<P>(levels, basis, length);
 
     let mut coefficients = vec![0u16; length];
+    let mut scratch = vec![0u16; length];
     coefficients[..f.len()].copy_from_slice(f);
-    coefficient_pass::<P>(&mut coefficients, &plan, levels);
+    coefficient_pass::<P>(&mut coefficients, &mut scratch, &plan, levels);
 
     // Each leaf constant takes the same value across its whole output block.
     let span = P::Q >> levels;
@@ -243,8 +376,9 @@ fn evaluate<P: Params>(out: &mut [u16], f: &[u16], basis: Vec<u16>) {
     for depth in (0..levels).rev() {
         let block = P::Q >> depth;
         let half = block / 2;
-        debug_assert_eq!(half, 1 << plan.gammas[depth].len());
-        subspace_prefix(&mut prefix, &plan.gammas[depth]);
+        let gamma = &plan.gammas[depth][..P::M - depth - 1];
+        debug_assert_eq!(half, 1 << gamma.len());
+        subspace_prefix(&mut prefix, gamma);
 
         for start in (0..P::Q).step_by(block) {
             let (low, high) = out[start..start + block].split_at_mut(half);
@@ -280,9 +414,11 @@ pub(crate) fn eval_transpose_bitrev<P: Params>(out: &mut [u16], values: &[u16]) 
     let length = out.len().next_power_of_two();
     let levels = length.trailing_zeros() as usize;
     debug_assert!(levels <= P::M);
-    let plan = levels_for::<P>(levels, reversed_basis::<P>());
+    let basis = reversed_basis::<P>();
+    let plan = levels_with_powers::<P>(levels, &basis[..P::M], length);
 
     let mut work = values.to_vec();
+    let mut scratch = vec![0u16; length];
 
     // Butterflies transposed: the level order reverses, and each two-by-two step becomes
     // `(low, high) -> (low + high, high + omega (low + high))`.
@@ -290,8 +426,9 @@ pub(crate) fn eval_transpose_bitrev<P: Params>(out: &mut [u16], values: &[u16]) 
     for depth in 0..levels {
         let block = P::Q >> depth;
         let half = block / 2;
-        debug_assert_eq!(half, 1 << plan.gammas[depth].len());
-        subspace_prefix(&mut prefix, &plan.gammas[depth]);
+        let gamma = &plan.gammas[depth][..P::M - depth - 1];
+        debug_assert_eq!(half, 1 << gamma.len());
+        subspace_prefix(&mut prefix, gamma);
 
         for start in (0..P::Q).step_by(block) {
             let (low, high) = work[start..start + block].split_at_mut(half);
@@ -319,7 +456,7 @@ pub(crate) fn eval_transpose_bitrev<P: Params>(out: &mut [u16], values: &[u16]) 
         *slot = acc;
     }
 
-    coefficient_pass_transpose::<P>(&mut coefficients, &plan, levels);
+    coefficient_pass_transpose::<P>(&mut coefficients, &mut scratch, &plan, levels);
     out.copy_from_slice(&coefficients[..out.len()]);
 }
 
@@ -380,6 +517,7 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
     out: &mut [Word],
     f: &[u16],
     tables: &Tables<P::Field>,
+    workspace: &mut TransformWorkspace,
 ) {
     debug_assert_eq!(out.len(), sliced_words::<P>());
 
@@ -387,11 +525,19 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
     let length = f.len().next_power_of_two();
     let levels = length.trailing_zeros() as usize;
     debug_assert!(levels <= P::M);
-    let plan = levels_for::<P>(levels, reversed_basis::<P>());
+    let TransformWorkspace {
+        levels: plan,
+        storage,
+    } = workspace;
+    debug_assert!(plan.count >= levels);
 
-    let mut coefficients = vec![0u16; length];
+    let workspace_length = storage.len() / 2;
+    let (coefficients, scratch) = storage.split_at_mut(workspace_length);
+    let coefficients = &mut coefficients[..length];
+    let scratch = &mut scratch[..length];
+    coefficients.fill(0);
     coefficients[..f.len()].copy_from_slice(f);
-    coefficient_pass::<P>(&mut coefficients, &plan, levels);
+    coefficient_pass::<P>(coefficients, scratch, plan, levels);
 
     // Leaves, built directly as bit-planes. Each constant covers `span` consecutive lanes.
     let span = P::Q >> levels;
@@ -422,7 +568,6 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
 
     let mut product = [0; MAX_BITS];
     for depth in (0..levels).rev() {
-        let gamma = &plan.gammas[depth];
         let half = P::Q >> (depth + 1);
 
         if half >= LANES {
@@ -431,14 +576,14 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
             // The subspace sum depends on the offset within a block, not on which block, so it
             // is built once per offset rather than once per pair.
             for offset in 0..half_groups {
-                let omega = omega_group(gamma, offset * LANES, bits);
+                let omega = &plan.omegas[plan.omega_starts[depth] + offset];
                 for base_group in (0..groups).step_by(half_groups * 2) {
                     let low_group = base_group + offset;
 
                     let mut low = load(out, low_group, bits);
                     let high = load(out, low_group + half_groups, bits);
 
-                    tables.mul(&mut product, &high, &omega);
+                    tables.mul(&mut product, &high, omega);
                     for i in 0..bits {
                         low[i] ^= product[i];
                     }
@@ -453,7 +598,7 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
             }
         } else {
             // The pair sits inside one group, `half` lanes apart.
-            let omega = omega_group(gamma, 0, bits);
+            let omega = &plan.omegas[plan.omega_starts[depth]];
             let keep = lane_run_mask(half);
 
             for group in 0..groups {
@@ -465,7 +610,7 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
                     high[i] = (word[i] >> half) & keep;
                 }
 
-                tables.mul(&mut product, &high, &omega);
+                tables.mul(&mut product, &high, omega);
                 let mut merged = [0; MAX_BITS];
                 for i in 0..bits {
                     let new_low = low[i] ^ product[i];
@@ -480,57 +625,63 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
 }
 
 /// Apply the transpose of [`eval_all_bitrev_sliced`], reading bit-sliced values.
+#[cfg(feature = "decapsulate")]
 pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
     out: &mut [u16],
-    values: &[Word],
+    work: &mut [Word],
     tables: &Tables<P::Field>,
+    workspace: &mut TransformWorkspace,
 ) {
-    debug_assert_eq!(values.len(), sliced_words::<P>());
+    debug_assert_eq!(work.len(), sliced_words::<P>());
 
     let bits = P::M;
     let length = out.len().next_power_of_two();
     let levels = length.trailing_zeros() as usize;
     debug_assert!(levels <= P::M);
-    let plan = levels_for::<P>(levels, reversed_basis::<P>());
+    let TransformWorkspace {
+        levels: plan,
+        storage,
+    } = workspace;
+    debug_assert!(plan.count >= levels);
+    let workspace_length = storage.len() / 2;
+    let (coefficients, scratch) = storage.split_at_mut(workspace_length);
 
-    let mut work = values.to_vec();
     let groups = P::Q / LANES;
     let mut product = [0; MAX_BITS];
 
     // Butterflies transposed: the level order reverses and each two-by-two step flips.
     for depth in 0..levels {
-        let gamma = &plan.gammas[depth];
         let half = P::Q >> (depth + 1);
 
         if half >= LANES {
             let half_groups = half / LANES;
             for offset in 0..half_groups {
-                let omega = omega_group(gamma, offset * LANES, bits);
+                let omega = &plan.omegas[plan.omega_starts[depth] + offset];
                 for base_group in (0..groups).step_by(half_groups * 2) {
                     let low_group = base_group + offset;
 
-                    let low = load(&work, low_group, bits);
-                    let mut high = load(&work, low_group + half_groups, bits);
+                    let low = load(work, low_group, bits);
+                    let mut high = load(work, low_group + half_groups, bits);
 
                     let mut sum = [0; MAX_BITS];
                     for i in 0..bits {
                         sum[i] = low[i] ^ high[i];
                     }
-                    tables.mul(&mut product, &sum, &omega);
+                    tables.mul(&mut product, &sum, omega);
                     for i in 0..bits {
                         high[i] ^= product[i];
                     }
 
-                    store(&mut work, low_group, bits, &sum);
-                    store(&mut work, low_group + half_groups, bits, &high);
+                    store(work, low_group, bits, &sum);
+                    store(work, low_group + half_groups, bits, &high);
                 }
             }
         } else {
-            let omega = omega_group(gamma, 0, bits);
+            let omega = &plan.omegas[plan.omega_starts[depth]];
             let keep = lane_run_mask(half);
 
             for group in 0..groups {
-                let word = load(&work, group, bits);
+                let word = load(work, group, bits);
                 let mut low = [0; MAX_BITS];
                 let mut high = [0; MAX_BITS];
                 for i in 0..bits {
@@ -542,7 +693,7 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
                 for i in 0..bits {
                     sum[i] = low[i] ^ high[i];
                 }
-                tables.mul(&mut product, &sum, &omega);
+                tables.mul(&mut product, &sum, omega);
 
                 let mut merged = [0; MAX_BITS];
                 for i in 0..bits {
@@ -550,7 +701,7 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
                     merged[i] = sum[i] | (new_high << half);
                 }
 
-                store(&mut work, group, bits, &merged);
+                store(work, group, bits, &merged);
             }
         }
     }
@@ -558,7 +709,8 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
     // Broadcasting a constant across a leaf block transposes into summing that block, which in
     // bit-sliced form is the parity of each masked bit-plane.
     let span = P::Q >> levels;
-    let mut coefficients = vec![0u16; length];
+    let coefficients = &mut coefficients[..length];
+    let scratch = &mut scratch[..length];
     for (leaf, slot) in coefficients.iter_mut().enumerate() {
         let start = leaf * span;
         let mut value = 0u16;
@@ -582,7 +734,7 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
         *slot = value;
     }
 
-    coefficient_pass_transpose::<P>(&mut coefficients, &plan, levels);
+    coefficient_pass_transpose::<P>(coefficients, scratch, plan, levels);
     out.copy_from_slice(&coefficients[..out.len()]);
 }
 
@@ -775,6 +927,7 @@ mod tests {
 
         let mut rng = Rng(seed);
         let tables = Tables::<P::Field>::new();
+        let mut workspace = TransformWorkspace::new::<P>();
         let width = 2 * P::T;
 
         for degree in [1usize, P::T, P::T + 1] {
@@ -786,7 +939,7 @@ mod tests {
             eval_all_bitrev::<P>(&mut expected, &f);
 
             let mut sliced = vec![0; sliced_words::<P>()];
-            eval_all_bitrev_sliced::<P>(&mut sliced, &f, &tables);
+            eval_all_bitrev_sliced::<P>(&mut sliced, &f, &tables, &mut workspace);
 
             let mut actual = vec![0u16; P::Q];
             for group in 0..P::Q / LANES {
@@ -796,7 +949,9 @@ mod tests {
             assert_eq!(actual, expected, "{} forward degree {degree}", P::NAME);
         }
 
-        // And the transpose, fed the bit-sliced form of a random input.
+        // And the transpose, fed the bit-sliced form of a random input. Only decapsulation
+        // computes syndromes, so a build without it has no transposed transform to check.
+        #[cfg(feature = "decapsulate")]
         for _ in 0..3 {
             let values: Vec<u16> = (0..P::Q)
                 .map(|_| (rng.next() as u16) & <P::Field as Field>::MASK)
@@ -816,7 +971,7 @@ mod tests {
             }
 
             let mut actual = vec![0u16; width];
-            eval_transpose_bitrev_sliced::<P>(&mut actual, &sliced, &tables);
+            eval_transpose_bitrev_sliced::<P>(&mut actual, &mut sliced, &tables, &mut workspace);
             assert_eq!(actual, expected, "{} transpose", P::NAME);
         }
     }

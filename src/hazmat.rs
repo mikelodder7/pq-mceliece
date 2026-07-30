@@ -35,29 +35,28 @@ mod hash;
 mod models;
 mod params;
 
-// Supporting machinery, compiled only for the operations that reach it. Encapsulation needs
-// none of it: `Encode` is pure bit manipulation over the public key.
+// Supporting machinery, compiled only for the operations that reach it.
 #[cfg(feature = "decapsulate")]
 mod benes;
 #[cfg(feature = "keygen")]
 mod controlbits;
-#[cfg(feature = "decapsulate")]
+#[cfg(any(feature = "keygen", feature = "decapsulate"))]
 mod fft;
 #[cfg(feature = "keygen")]
 mod matrix;
 #[cfg(feature = "keygen")]
 mod poly;
-#[cfg(feature = "keygen")]
+#[cfg(any(feature = "keygen", feature = "encapsulate"))]
 mod sort;
 #[cfg(feature = "decapsulate")]
 mod transpose;
-#[cfg(feature = "decapsulate")]
+#[cfg(any(feature = "keygen", feature = "decapsulate"))]
 mod vec;
 
 #[cfg(feature = "decapsulate")]
-mod decap;
+pub(crate) mod decap;
 #[cfg(feature = "encapsulate")]
-mod encap;
+pub(crate) mod encap;
 #[cfg(feature = "keygen")]
 mod keygen;
 

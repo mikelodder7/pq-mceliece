@@ -4,10 +4,35 @@
 */
 //! Implementations of the traits from the [`kem`] crate.
 //!
-//! These wrap the [`hazmat`](crate::hazmat) layer in the fixed-size array types that the `kem`
-//! traits use, so Classic McEliece can be dropped into generic code alongside other KEMs. The
-//! arrays are large: an `mceliece8192128` encapsulation key is a `[u8; 1357824]`, so prefer
-//! passing these by reference and keep an eye on stack usage.
+//! These wrap the [`hazmat`] layer in the fixed-size array types that the `kem`
+//! traits use, so Classic McEliece can be dropped into generic code alongside other KEMs.
+//!
+//! # Stack usage
+//!
+//! Classic McEliece encapsulation keys are far larger than the values these traits were shaped
+//! for, and [`KeyExport::to_bytes`] returns one **by value**:
+//!
+//! | parameter set | encapsulation key |
+//! | ------------- | ----------------- |
+//! | `mceliece348864` | 261,120 bytes |
+//! | `mceliece460896` | 524,160 bytes |
+//! | `mceliece6688128` | 1,044,992 bytes |
+//! | `mceliece6960119` | 1,047,319 bytes |
+//! | `mceliece8192128` | 1,357,824 bytes |
+//!
+//! The signature comes from the trait, so a caller writing `let bytes = key.to_bytes();` holds
+//! a megabyte-scale local no matter what this crate does. On Rust's default 2 MiB thread stack
+//! that overflows and aborts for the larger sets in an unoptimized build, where the copies a
+//! release build elides are all materialized. Importing through [`TryKeyInit::new`] needs the
+//! same array to exist somewhere.
+//!
+//! Encapsulation and decapsulation are unaffected: ciphertexts and shared keys are a few
+//! hundred bytes, and the key types themselves are heap-backed handles of a few dozen bytes.
+//! Only key import and export move the large arrays.
+//!
+//! If that is a problem, use [`Algorithm`](crate::Algorithm) or the [`hazmat`] layer instead:
+//! both keep key material on the heap and hand out slices. Otherwise, give the thread a stack
+//! that comfortably exceeds twice the key size.
 
 use hybrid_array::{Array, ArraySize};
 use kem::{
@@ -107,8 +132,7 @@ impl<K: KemSizes> Generate for DecapsulationKey<K> {
     fn try_generate_from_rng<R: TryCryptoRng + ?Sized>(rng: &mut R) -> Result<Self, R::Error> {
         let mut seed = Zeroizing::new([0u8; 32]);
         rng.try_fill_bytes(seed.as_mut())?;
-        let (ek, dk) = <K as hazmat::Kem>::generate_keypair_from_seed(seed.as_ref())
-            .expect("a 32-byte seed is always the right length");
+        let (ek, dk) = hazmat::generate_keypair_from_seed_array::<K>(&seed);
         Ok(Self {
             key: dk,
             encapsulation_key: EncapsulationKey(ek),
@@ -137,8 +161,9 @@ where
     /// rejection string, and one whose padding bits are nonzero yields an all-ones key, both
     /// of which are what the reference implementation produces.
     fn decapsulate(&self, ct: &Ciphertext<K>) -> SharedKey<K> {
-        let ct = hazmat::Ciphertext::<K>::from_slice(ct.as_slice())
-            .expect("the array length is the ciphertext length by construction");
+        let Ok(ct) = hazmat::Ciphertext::<K>::from_slice(ct.as_slice()) else {
+            return SharedKey::<K>::default();
+        };
         let shared = match <K as hazmat::Kem>::decapsulate(&self.key, &ct) {
             Ok(shared) => shared.into_vec(),
             Err(_) => vec![0xFFu8; K::SHARED_SECRET_LENGTH],
@@ -247,13 +272,88 @@ mod tests {
         assert_eq!(imported.encapsulation_key(), &ek);
     }
 
+    fn traits_round_trip_with_large_stack<K>(seed: u8)
+    where
+        K: KemSizes
+            + kem::Kem<EncapsulationKey = EncapsulationKey<K>, DecapsulationKey = DecapsulationKey<K>>,
+    {
+        // This round trip exports and reimports both keys, and `KeyExport::to_bytes` hands
+        // back a megabyte-scale array by value for the larger parameter sets. See the module
+        // documentation's stack usage section: the default thread stack cannot hold one, so
+        // the test supplies its own rather than pretending the requirement is not there.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || traits_round_trip::<K>(seed))
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The `kem` traits cannot report failure, so they answer a rejected value with a fixed
+    /// substitute instead. `mceliece6960119` is the one standardized set whose `mt` and `k` are
+    /// not multiples of eight, so it is the only one where padding bits exist to corrupt.
+    #[cfg(feature = "mceliece6960119")]
+    #[test]
+    fn rejected_values_yield_the_documented_substitutes() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                use kem::Kem as _;
+                type K = hazmat::McEliece6960119;
+
+                let mut rng = rand_chacha::ChaCha8Rng::from_seed([41u8; 32]);
+                let (dk, ek) = K::generate_keypair_from_rng(&mut rng);
+                let (ct, sent) = ek.encapsulate_with_rng(&mut rng);
+
+                // Setting the ciphertext's padding bits must give an all-ones shared key.
+                let mut damaged = ct;
+                let last = damaged.len() - 1;
+                damaged[last] = 0xFF;
+                assert_ne!(dk.decapsulate(&damaged), sent);
+                assert!(dk.decapsulate(&damaged).iter().all(|&b| b == 0xFF));
+
+                // Setting the encapsulation key's padding bits must give an all-zero pair.
+                let mut key_bytes = ek.to_bytes();
+                let last = key_bytes.len() - 1;
+                key_bytes[last] = 0xFF;
+                let damaged_key = EncapsulationKey::<K>::new(&key_bytes).unwrap();
+                let (ct, shared) = damaged_key.encapsulate_with_rng(&mut rng);
+                assert!(ct.iter().all(|&b| b == 0));
+                assert!(shared.iter().all(|&b| b == 0));
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// The module documentation promises that only key import and export move the large
+    /// arrays, and that encapsulation and decapsulation stay clear of them. Assert it on an
+    /// ordinary thread: no large-stack wrapper here, deliberately. The largest parameter set
+    /// has a 1.3 MB encapsulation key, so if any of these paths ever starts passing one by
+    /// value this aborts on the default stack rather than quietly regressing.
+    #[cfg(feature = "mceliece8192128")]
+    #[test]
+    fn hot_path_does_not_need_a_large_stack() {
+        use kem::Kem as _;
+        type K = hazmat::McEliece8192128;
+
+        let mut rng = rand_chacha::ChaCha8Rng::from_seed([53u8; 32]);
+        let (dk, ek) = K::generate_keypair_from_rng(&mut rng);
+        let (ct, sent) = ek.encapsulate_with_rng(&mut rng);
+        assert_eq!(dk.decapsulate(&ct), sent);
+
+        // The handles themselves stay small; the key bytes live on the heap.
+        assert!(core::mem::size_of::<EncapsulationKey<K>>() <= 64);
+        assert!(core::mem::size_of::<DecapsulationKey<K>>() <= 128);
+    }
+
     macro_rules! kem_trait_tests {
         ($($feature:literal => $name:ident, $params:ident, $seed:expr;)+) => {
             $(
                 #[test]
                 #[cfg(feature = $feature)]
                 fn $name() {
-                    traits_round_trip::<hazmat::$params>($seed);
+                    traits_round_trip_with_large_stack::<hazmat::$params>($seed);
                 }
             )+
         };

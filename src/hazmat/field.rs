@@ -41,14 +41,10 @@ pub trait Field:
 
     /// Square a field element.
     ///
-    /// Squaring only appears in two places: the inversion chain over `GF(2^12)`, and the
-    /// `g(alpha)^2` of the Goppa syndrome. `GF(2^13)` inverts through fused helpers instead,
-    /// so a key-generation-only build over that field never needs this.
-    #[cfg(any(
-        feature = "decapsulate",
-        feature = "mceliece348864",
-        feature = "mceliece348864f"
-    ))]
+    /// Squaring appears in the inversion chain over `GF(2^12)`, in the `g(alpha)^2` of the
+    /// Goppa syndrome, and in the additive transform's subspace polynomials, which key
+    /// generation reaches through its inverse evaluations.
+    #[cfg(any(feature = "keygen", feature = "decapsulate"))]
     fn sq(a: Elem) -> Elem;
 
     /// Invert a field element. `inv(0)` is defined to be `0`.
@@ -57,7 +53,7 @@ pub trait Field:
     /// Compute `num / den`. `frac(0, num)` is defined to be `0`.
     ///
     /// Only Berlekamp-Massey divides, so this is only present with the `decapsulate` feature.
-    #[cfg(feature = "decapsulate")]
+    #[cfg(all(feature = "decapsulate", any(test, feature = "hazmat")))]
     fn frac(den: Elem, num: Elem) -> Elem {
         Self::mul(Self::inv(den), num)
     }
@@ -96,6 +92,7 @@ pub const fn is_zero_mask(a: Elem) -> Elem {
 
 /// Add two field elements. Addition in characteristic two is exclusive-or.
 #[inline]
+#[cfg(any(feature = "keygen", test, feature = "hazmat"))]
 pub const fn add(a: Elem, b: Elem) -> Elem {
     a ^ b
 }
@@ -284,11 +281,7 @@ impl Field for Gf13 {
         Self::reduce(clmul(a & Self::MASK, b & Self::MASK))
     }
 
-    #[cfg(any(
-    feature = "decapsulate",
-    feature = "mceliece348864",
-    feature = "mceliece348864f"
-))]
+    #[cfg(any(feature = "keygen", feature = "decapsulate"))]
     #[inline]
     fn sq(a: Elem) -> Elem {
         let mut x = (a & Self::MASK) as u32;
@@ -304,7 +297,7 @@ impl Field for Gf13 {
         Self::divide(a, 1)
     }
 
-    #[cfg(feature = "decapsulate")]
+    #[cfg(all(feature = "decapsulate", any(test, feature = "hazmat")))]
     #[inline]
     fn frac(den: Elem, num: Elem) -> Elem {
         Self::divide(den, num)
@@ -485,6 +478,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "keygen")]
     fn is_zero_mask_selects_all_or_nothing() {
         assert_eq!(is_zero_mask(0), 0x1FFF);
         for a in 1u16..=u16::MAX {

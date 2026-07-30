@@ -13,7 +13,12 @@
 //! The straightforward path is [`Algorithm`], which carries the parameter set as a value:
 //!
 //! ```
-//! # #[cfg(feature = "mceliece348864f")] {
+//! # #[cfg(all(
+//! #     feature = "mceliece348864f",
+//! #     feature = "keygen",
+//! #     feature = "encapsulate",
+//! #     feature = "decapsulate"
+//! # ))] {
 //! use pq_mceliece::Algorithm;
 //! use rand::rngs::SysRng;
 //! use rand_core::UnwrapErr;
@@ -31,6 +36,7 @@
 //! backed-up seed material:
 //!
 //! ```
+//! # #[cfg(feature = "keygen")] {
 //! use pq_mceliece::Algorithm;
 //!
 //! // Any enabled parameter set works; `default` picks the first one.
@@ -39,6 +45,7 @@
 //! let first = alg.generate_keypair_from_seed(seed).unwrap();
 //! let second = alg.generate_keypair_from_seed(seed).unwrap();
 //! assert_eq!(first, second);
+//! # }
 //! ```
 //!
 //! When the parameter set is known at compile time, the [`hazmat`] layer offers the same
@@ -46,7 +53,13 @@
 //! passed to another:
 //!
 //! ```
-//! # #[cfg(all(feature = "mceliece348864", feature = "hazmat"))] {
+//! # #[cfg(all(
+//! #     feature = "mceliece348864",
+//! #     feature = "hazmat",
+//! #     feature = "keygen",
+//! #     feature = "encapsulate",
+//! #     feature = "decapsulate"
+//! # ))] {
 //! use pq_mceliece::hazmat::{Kem, McEliece348864};
 //! use rand::rngs::SysRng;
 //! use rand_core::UnwrapErr;
@@ -59,8 +72,7 @@
 //! # }
 //! ```
 //!
-//! Implementations of the [`kem`](https://docs.rs/kem) crate traits live in the
-//! [`kem`](crate::kem) module.
+//! Implementations of the [`kem`](https://docs.rs/kem) crate traits live in the [`kem`] module.
 //!
 //! ## Standards
 //!
@@ -145,6 +157,26 @@ compile_error!(
      select at least one of `keygen`, `encapsulate` or `decapsulate`"
 );
 
+/// Compiles the README's examples as doctests so they cannot drift from the API.
+///
+/// Only exists under `cargo test --doc`, so it adds nothing to the rendered documentation or
+/// to a normal build. Gated on everything the examples name, so that a build without those
+/// features skips them rather than failing on code it was never going to compile. That keeps
+/// the feature gating in here instead of scattered through the README, where hidden doctest
+/// lines would still be visible to anyone reading it on the repository page.
+#[cfg(all(
+    doctest,
+    feature = "hazmat",
+    feature = "keygen",
+    feature = "encapsulate",
+    feature = "decapsulate",
+    feature = "mceliece348864f",
+    feature = "mceliece6960119f",
+    feature = "mceliece8192128f"
+))]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeExamples;
+
 mod error;
 pub use error::*;
 
@@ -157,7 +189,7 @@ pub mod hazmat;
 mod hazmat;
 
 use ctutils::{Choice, CtEq};
-#[cfg(any(feature = "keygen", feature = "encapsulate", feature = "decapsulate"))]
+#[cfg(feature = "keygen")]
 use hazmat::Kem;
 use hazmat::Params;
 #[cfg(any(feature = "keygen", feature = "encapsulate"))]
@@ -748,6 +780,100 @@ impl DecapsulationKey {
     pub fn decapsulate(&self, ciphertext: &Ciphertext) -> McElieceResult<SharedSecret> {
         self.algorithm.decapsulate(self, ciphertext)
     }
+
+    /// Precompute the key-derived part of decoding, for repeated decapsulation.
+    ///
+    /// About a third of a decapsulation depends only on the private key, not on the message.
+    /// Doing it once here rather than once per ciphertext is worth roughly a third off each
+    /// subsequent [`PreparedDecapsulationKey::decapsulate`], at the cost of holding the derived
+    /// material alongside the key. Decapsulating a single message is not worth preparing for.
+    pub fn prepare(&self) -> PreparedDecapsulationKey {
+        let (scale, valid) = with_params!(&self.algorithm, P, {
+            let mut scale = vec![0; hazmat::decap::scale_words::<P>()];
+            let mut valid = vec![0u8; hazmat::decap::valid_bytes::<P>()];
+            hazmat::decap::prepare::<P>(&self.value, &mut scale, &mut valid);
+            (scale, valid)
+        });
+        PreparedDecapsulationKey {
+            key: self.clone(),
+            scale,
+            valid,
+        }
+    }
+}
+
+/// A [`DecapsulationKey`] with the message-independent part of decoding already computed.
+///
+/// Produced by [`DecapsulationKey::prepare`]. The derived material is a function of the private
+/// key alone and is as sensitive as the key itself, so it is zeroized on drop and never
+/// serialized: store and transmit the [`DecapsulationKey`] and prepare again on the far side.
+#[cfg(feature = "decapsulate")]
+pub struct PreparedDecapsulationKey {
+    key: DecapsulationKey,
+    scale: Vec<hazmat::decap::PreparedWord>,
+    valid: Vec<u8>,
+}
+
+#[cfg(feature = "decapsulate")]
+impl PreparedDecapsulationKey {
+    /// The parameter set this key belongs to.
+    pub fn algorithm(&self) -> Algorithm {
+        self.key.algorithm
+    }
+
+    /// The key this was prepared from.
+    pub fn key(&self) -> &DecapsulationKey {
+        &self.key
+    }
+
+    /// Recover the shared secret from a ciphertext.
+    ///
+    /// Identical in result to [`DecapsulationKey::decapsulate`], including which ciphertexts are
+    /// rejected and the session key produced for those that fail to decode.
+    pub fn decapsulate(&self, ciphertext: &Ciphertext) -> McElieceResult<SharedSecret> {
+        let algorithm = self.key.algorithm;
+        if ciphertext.algorithm != algorithm {
+            return Err(Error::AlgorithmMismatch);
+        }
+        with_params!(&algorithm, P, {
+            if ciphertext.value.len() != P::CIPHERTEXT_LENGTH {
+                return Err(Error::InvalidCiphertextLength(ciphertext.value.len()));
+            }
+            let mut ss = vec![0u8; P::SHARED_SECRET_LENGTH];
+            if !hazmat::decap::decapsulate_prepared::<P>(
+                &mut ss,
+                &ciphertext.value,
+                &self.key.value,
+                &self.scale,
+                &self.valid,
+            ) {
+                return Err(Error::CiphertextPadding);
+            }
+            Ok(SharedSecret {
+                algorithm,
+                value: ss,
+            })
+        })
+    }
+}
+
+#[cfg(feature = "decapsulate")]
+impl Drop for PreparedDecapsulationKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.scale.zeroize();
+        self.valid.zeroize();
+    }
+}
+
+#[cfg(feature = "decapsulate")]
+impl core::fmt::Debug for PreparedDecapsulationKey {
+    /// Deliberately opaque: the derived material is as sensitive as the private key.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PreparedDecapsulationKey")
+            .field("algorithm", &self.key.algorithm)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Algorithm {
@@ -781,7 +907,6 @@ impl Algorithm {
 
     /// Generate a key pair, drawing a fresh seed from `rng`.
     #[cfg(feature = "keygen")]
-    #[cfg(feature = "keygen")]
     pub fn generate_keypair(&self, rng: impl CryptoRng) -> (EncapsulationKey, DecapsulationKey) {
         with_params!(self, P, {
             let (ek, dk) = <P as Kem>::generate_keypair(rng);
@@ -802,7 +927,6 @@ impl Algorithm {
     ///
     /// The seed must come from a cryptographically secure source and is exactly as sensitive
     /// as the resulting private key.
-    #[cfg(feature = "keygen")]
     #[cfg(feature = "keygen")]
     pub fn generate_keypair_from_seed<B: AsRef<[u8]>>(
         &self,
@@ -834,16 +958,22 @@ impl Algorithm {
             return Err(Error::AlgorithmMismatch);
         }
         with_params!(self, P, {
-            let typed = hazmat::EncapsulationKey::<P>::from_slice(&key.value)?;
-            let (ct, ss) = <P as Kem>::encapsulate(&typed, rng)?;
+            if key.value.len() != P::PUBLIC_KEY_LENGTH {
+                return Err(Error::InvalidEncapsulationKeyLength(key.value.len()));
+            }
+            let mut ct = vec![0u8; P::CIPHERTEXT_LENGTH];
+            let mut ss = vec![0u8; P::SHARED_SECRET_LENGTH];
+            if !hazmat::encap::encapsulate::<P>(&mut ct, &mut ss, &key.value, rng) {
+                return Err(Error::EncapsulationKeyPadding);
+            }
             Ok((
                 Ciphertext {
                     algorithm: *self,
-                    value: ct.into_vec(),
+                    value: ct,
                 },
                 SharedSecret {
                     algorithm: *self,
-                    value: ss.into_vec(),
+                    value: ss,
                 },
             ))
         })
@@ -865,18 +995,24 @@ impl Algorithm {
             return Err(Error::AlgorithmMismatch);
         }
         with_params!(self, P, {
-            let typed_key = hazmat::DecapsulationKey::<P>::from_slice(&key.value)?;
-            let typed_ct = hazmat::Ciphertext::<P>::from_slice(&ciphertext.value)?;
-            let ss = <P as Kem>::decapsulate(&typed_key, &typed_ct)?;
+            if key.value.len() != P::SECRET_KEY_LENGTH {
+                return Err(Error::InvalidDecapsulationKeyLength(key.value.len()));
+            }
+            if ciphertext.value.len() != P::CIPHERTEXT_LENGTH {
+                return Err(Error::InvalidCiphertextLength(ciphertext.value.len()));
+            }
+            let mut ss = vec![0u8; P::SHARED_SECRET_LENGTH];
+            if !hazmat::decap::decapsulate::<P>(&mut ss, &ciphertext.value, &key.value) {
+                return Err(Error::CiphertextPadding);
+            }
             Ok(SharedSecret {
                 algorithm: *self,
-                value: ss.into_vec(),
+                value: ss,
             })
         })
     }
 
     /// Recover an encapsulation key from a decapsulation key.
-    #[cfg(feature = "keygen")]
     #[cfg(feature = "keygen")]
     pub fn encapsulation_key_from_decapsulation_key(
         &self,
@@ -974,6 +1110,57 @@ impl<'de> serde::Deserialize<'de> for Algorithm {
 ))]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// A prepared key must be indistinguishable from the key it came from, including on the
+    /// implicit-rejection path where a corrupted ciphertext still yields a reproducible secret.
+    #[cfg(all(feature = "keygen", feature = "encapsulate", feature = "decapsulate"))]
+    #[test]
+    fn prepared_decapsulation_matches_the_plain_path() {
+        use rand_core::{SeedableRng, UnwrapErr};
+
+        for &algorithm in Algorithm::enabled_algorithms() {
+            let mut rng = UnwrapErr(rand_chacha::ChaCha8Rng::from_seed([29u8; 32]));
+            let (ek, dk) = algorithm.generate_keypair(&mut rng);
+            let prepared = dk.prepare();
+            assert_eq!(prepared.algorithm(), algorithm);
+            assert_eq!(prepared.key(), &dk);
+
+            let (ct, sent) = algorithm
+                .encapsulate(&ek, &mut rng)
+                .expect("a freshly generated key encapsulates");
+            let direct = dk.decapsulate(&ct).expect("the ciphertext is well formed");
+            let via_prepared = prepared.decapsulate(&ct).expect("likewise");
+            assert_eq!(direct, sent, "{}", algorithm.name());
+            assert_eq!(via_prepared, direct, "{} prepared", algorithm.name());
+
+            // Implicit rejection: flipping a syndrome bit must fail to decode, and both paths
+            // must still agree on the substitute secret.
+            let mut damaged = ct.clone();
+            damaged.value[0] ^= 1;
+            let direct = dk.decapsulate(&damaged);
+            let via_prepared = prepared.decapsulate(&damaged);
+            assert_eq!(direct, via_prepared, "{} rejected", algorithm.name());
+            if let Ok(secret) = direct {
+                assert_ne!(secret, sent, "{} rejection", algorithm.name());
+            }
+
+            // A ciphertext from another parameter set must be refused, not decoded.
+            let other = Algorithm::enabled_algorithms()
+                .iter()
+                .find(|&&a| a != algorithm)
+                .copied();
+            if let Some(other) = other {
+                let (other_ek, _) = other.generate_keypair(&mut rng);
+                let (other_ct, _) = other
+                    .encapsulate(&other_ek, &mut rng)
+                    .expect("a freshly generated key encapsulates");
+                assert!(matches!(
+                    prepared.decapsulate(&other_ct),
+                    Err(Error::AlgorithmMismatch)
+                ));
+            }
+        }
+    }
     use super::*;
     use rand_core::SeedableRng;
 
@@ -1099,6 +1286,36 @@ mod tests {
     }
 
     #[test]
+    fn the_dynamic_api_rejects_default_values_without_panicking() {
+        let algorithm = Algorithm::default();
+        let mut rng = rand_chacha::ChaCha8Rng::from_seed([6u8; 32]);
+        assert_eq!(
+            algorithm
+                .encapsulate(&EncapsulationKey::default(), &mut rng)
+                .unwrap_err(),
+            Error::InvalidEncapsulationKeyLength(0)
+        );
+        assert_eq!(
+            algorithm
+                .decapsulate(&DecapsulationKey::default(), &Ciphertext::default())
+                .unwrap_err(),
+            Error::InvalidDecapsulationKeyLength(0)
+        );
+
+        let key = DecapsulationKey::from_bytes(
+            algorithm,
+            vec![0; algorithm.params().decapsulation_key_length],
+        )
+        .unwrap();
+        assert_eq!(
+            algorithm
+                .decapsulate(&key, &Ciphertext::default())
+                .unwrap_err(),
+            Error::InvalidCiphertextLength(0)
+        );
+    }
+
+    #[test]
     fn a_round_trip_recovers_the_shared_secret_and_rejection_is_stable() {
         let alg = Algorithm::enabled_algorithms()[0];
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([13u8; 32]);
@@ -1139,9 +1356,113 @@ mod tests {
         }
     }
 
+    /// The padding accessors are how a caller inspects the *narrowly decoded* rejection before
+    /// it happens, and `mceliece6960119` is the one standardized set that has padding at all.
+    #[cfg(all(feature = "keygen", feature = "encapsulate"))]
+    #[test]
+    fn padding_accessors_report_both_outcomes() {
+        for &algorithm in Algorithm::enabled_algorithms() {
+            let mut rng = rand_chacha::ChaCha8Rng::from_seed([23u8; 32]);
+            let (ek, _) = algorithm.generate_keypair(&mut rng);
+            let (ct, _) = algorithm.encapsulate(&ek, &mut rng).unwrap();
+
+            assert!(ek.padding_is_zero(), "{} fresh key", algorithm.name());
+            assert!(
+                ct.padding_is_zero(),
+                "{} fresh ciphertext",
+                algorithm.name()
+            );
+
+            // Setting every padding bit is only detectable where padding exists.
+            let has_padding = algorithm.params().k % 8 != 0;
+            let mut damaged = ek.clone();
+            let last = damaged.value.len() - 1;
+            damaged.value[last] = 0xFF;
+            assert_eq!(
+                damaged.padding_is_zero(),
+                !has_padding,
+                "{} damaged key",
+                algorithm.name()
+            );
+
+            // The padding sits at the end of the syndrome, which for a `pc` set is not the end
+            // of the ciphertext: the plaintext-confirmation hash follows it.
+            let params = algorithm.params();
+            let syndrome_bytes = (params.m * params.t).div_ceil(8);
+            let ciphertext_has_padding = params.m * params.t % 8 != 0;
+            let mut damaged = ct.clone();
+            damaged.value[syndrome_bytes - 1] = 0xFF;
+            assert_eq!(
+                damaged.padding_is_zero(),
+                !ciphertext_has_padding,
+                "{} damaged ciphertext",
+                algorithm.name()
+            );
+
+            // A value of the wrong length belongs to no parameter set and cannot be inspected.
+            let mut truncated = ek;
+            truncated.value.truncate(1);
+            assert!(
+                !truncated.padding_is_zero(),
+                "{} short key",
+                algorithm.name()
+            );
+            let mut truncated = ct;
+            truncated.value.truncate(1);
+            assert!(
+                !truncated.padding_is_zero(),
+                "{} short ciphertext",
+                algorithm.name()
+            );
+        }
+    }
+
     #[cfg(feature = "serde")]
     mod serde_tests {
         use super::*;
+
+        /// Deserialization is the crate's exposure to input it did not produce, so the paths
+        /// that reject malformed encodings need exercising as much as the round trip does.
+        #[cfg(all(feature = "keygen", feature = "encapsulate"))]
+        #[test]
+        fn deserialization_rejects_malformed_encodings() {
+            let alg = Algorithm::enabled_algorithms()[0];
+            let mut rng = rand_chacha::ChaCha8Rng::from_seed([17u8; 32]);
+            let (ek, _) = alg.generate_keypair(&mut rng);
+            let encoded = serde_json::to_string(&ek).unwrap();
+
+            // A repeated field must be refused rather than silently taking one of the two.
+            let doubled_algorithm = encoded.replacen('{', r#"{"algorithm":"mceliece348864","#, 1);
+            assert!(serde_json::from_str::<EncapsulationKey>(&doubled_algorithm).is_err());
+            let doubled_value = encoded.replacen('{', r#"{"value":"00","#, 1);
+            assert!(serde_json::from_str::<EncapsulationKey>(&doubled_value).is_err());
+
+            // So must a missing field, an unknown one, and a value that is not a hex string.
+            assert!(serde_json::from_str::<EncapsulationKey>(r#"{"value":"00"}"#).is_err());
+            assert!(
+                serde_json::from_str::<EncapsulationKey>(&encoded.replacen(
+                    '{',
+                    r#"{"nope":1,"#,
+                    1
+                ))
+                .is_err()
+            );
+            assert!(
+                serde_json::from_str::<EncapsulationKey>(
+                    r#"{"algorithm":"mceliece348864","value":"zz"}"#
+                )
+                .is_err()
+            );
+
+            // A shape that is not a map at all, and a value of the wrong length for its set.
+            assert!(serde_json::from_str::<EncapsulationKey>("[]").is_err());
+            assert!(
+                serde_json::from_str::<EncapsulationKey>(
+                    r#"{"algorithm":"mceliece348864","value":"00ff"}"#
+                )
+                .is_err()
+            );
+        }
 
         macro_rules! serde_round_trip {
             ($name:ident, $ser:path, $de:path) => {

@@ -13,14 +13,18 @@
 use core::marker::PhantomData;
 
 use ctutils::{Choice, CtEq};
-#[cfg(any(feature = "keygen", feature = "encapsulate"))]
+#[cfg(any(feature = "keygen", all(feature = "hazmat", feature = "encapsulate")))]
 use rand_core::CryptoRng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(feature = "decapsulate")]
-use super::decap::{ciphertext_padding_is_zero, decapsulate};
+use super::decap::ciphertext_padding_is_zero;
+#[cfg(all(feature = "decapsulate", any(feature = "hazmat", feature = "kem")))]
+use super::decap::decapsulate;
+#[cfg(all(feature = "encapsulate", any(feature = "hazmat", feature = "kem")))]
+use super::encap::encapsulate;
 #[cfg(feature = "encapsulate")]
-use super::encap::{encapsulate, public_key_padding_is_zero};
+use super::encap::public_key_padding_is_zero;
 #[cfg(feature = "keygen")]
 use super::keygen::{public_key_from_secret_key, seeded_keypair};
 use super::params::Params;
@@ -112,22 +116,22 @@ macro_rules! byte_value {
 
 byte_value! {
     /// A Classic McEliece encapsulation (public) key, the matrix `T`.
-    EncapsulationKey, PUBLIC_KEY_LENGTH, InvalidEncapsulationKeyLength, secret = false, constructed_when = any(feature = "keygen")
+    EncapsulationKey, PUBLIC_KEY_LENGTH, InvalidEncapsulationKeyLength, secret = false, constructed_when = feature = "keygen"
 }
 
 byte_value! {
     /// A Classic McEliece decapsulation (private) key, `(delta, c, g, alpha, s)`.
-    DecapsulationKey, SECRET_KEY_LENGTH, InvalidDecapsulationKeyLength, secret = true, constructed_when = any(feature = "keygen")
+    DecapsulationKey, SECRET_KEY_LENGTH, InvalidDecapsulationKeyLength, secret = true, constructed_when = feature = "keygen"
 }
 
 byte_value! {
     /// A Classic McEliece ciphertext.
-    Ciphertext, CIPHERTEXT_LENGTH, InvalidCiphertextLength, secret = false, constructed_when = any(feature = "encapsulate")
+    Ciphertext, CIPHERTEXT_LENGTH, InvalidCiphertextLength, secret = false, constructed_when = all(feature = "encapsulate", any(feature = "hazmat", feature = "kem"))
 }
 
 byte_value! {
     /// A Classic McEliece shared secret.
-    SharedSecret, SHARED_SECRET_LENGTH, InvalidSharedSecretLength, secret = true, constructed_when = any(feature = "encapsulate", feature = "decapsulate")
+    SharedSecret, SHARED_SECRET_LENGTH, InvalidSharedSecretLength, secret = true, constructed_when = any(all(feature = "encapsulate", any(feature = "hazmat", feature = "kem")), all(feature = "decapsulate", any(feature = "hazmat", feature = "kem")))
 }
 
 macro_rules! zeroize_on_drop {
@@ -195,6 +199,16 @@ impl<P: Params> From<&DecapsulationKey<P>> for EncapsulationKey<P> {
     }
 }
 
+#[cfg(feature = "keygen")]
+pub(crate) fn generate_keypair_from_seed_array<P: Params>(
+    seed: &[u8; 32],
+) -> (EncapsulationKey<P>, DecapsulationKey<P>) {
+    let mut public = EncapsulationKey::<P>::zeroed();
+    let mut secret = DecapsulationKey::<P>::zeroed();
+    seeded_keypair::<P>(&mut public.bytes, &mut secret.bytes, seed);
+    (public, secret)
+}
+
 #[cfg(feature = "decapsulate")]
 impl<P: Params> Ciphertext<P> {
     /// Whether every padding bit is zero.
@@ -209,6 +223,7 @@ impl<P: Params> Ciphertext<P> {
 ///
 /// This trait is blanket implemented for every type implementing [`Params`], so the parameter
 /// set marker itself is the entry point: `McEliece6960119f::generate_keypair(rng)`.
+#[cfg(any(feature = "keygen", feature = "hazmat", feature = "kem"))]
 pub trait Kem: Params {
     /// `SeededKeyGen`: derive a key pair deterministically from a 32-byte seed.
     ///
@@ -228,12 +243,10 @@ pub trait Kem: Params {
         let mut delta = [0u8; 32];
         delta.copy_from_slice(seed);
 
-        let mut public = EncapsulationKey::<Self>::zeroed();
-        let mut secret = DecapsulationKey::<Self>::zeroed();
-        seeded_keypair::<Self>(&mut public.bytes, &mut secret.bytes, &delta);
+        let pair = generate_keypair_from_seed_array::<Self>(&delta);
 
         delta.zeroize();
-        Ok((public, secret))
+        Ok(pair)
     }
 
     /// `KeyGen`: draw a fresh seed from `rng` and generate a key pair from it.
@@ -259,7 +272,7 @@ pub trait Kem: Params {
     /// Returns [`Error::EncapsulationKeyPadding`] when `key` has nonzero padding bits.
     ///
     /// Requires the `encapsulate` feature.
-    #[cfg(feature = "encapsulate")]
+    #[cfg(all(feature = "encapsulate", any(feature = "hazmat", feature = "kem")))]
     fn encapsulate(
         key: &EncapsulationKey<Self>,
         rng: impl CryptoRng,
@@ -285,7 +298,7 @@ pub trait Kem: Params {
     /// on public data.
     ///
     /// Requires the `decapsulate` feature.
-    #[cfg(feature = "decapsulate")]
+    #[cfg(all(feature = "decapsulate", any(feature = "hazmat", feature = "kem")))]
     fn decapsulate(
         key: &DecapsulationKey<Self>,
         ciphertext: &Ciphertext<Self>,
@@ -298,6 +311,7 @@ pub trait Kem: Params {
     }
 }
 
+#[cfg(any(feature = "keygen", feature = "hazmat", feature = "kem"))]
 impl<P: Params> Kem for P {}
 
 #[cfg(all(
@@ -311,6 +325,9 @@ mod tests {
     use super::*;
     use rand_core::SeedableRng;
 
+    /// The typed constructors and `Kem` methods only exist when the low-level layer or the
+    /// `kem` traits are exposed, so these need more than the three operation features.
+    #[cfg(any(feature = "hazmat", feature = "kem"))]
     fn typed_api_round_trips<P: Params>(seed: u8) {
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([seed; 32]);
         let (ek, dk) = P::generate_keypair(&mut rng);
@@ -361,6 +378,7 @@ mod tests {
         assert_eq!(dk1, dk2);
     }
 
+    #[cfg(any(feature = "hazmat", feature = "kem"))]
     fn padding_is_reported<P: Params>() {
         if !P::PUBLIC_KEY_HAS_PADDING {
             return;
@@ -395,6 +413,7 @@ mod tests {
                     use crate::hazmat::params::*;
 
                     #[test]
+                    #[cfg(any(feature = "hazmat", feature = "kem"))]
                     fn round_trips() {
                         typed_api_round_trips::<$params>($seed);
                     }
@@ -405,6 +424,7 @@ mod tests {
                     }
 
                     #[test]
+                    #[cfg(any(feature = "hazmat", feature = "kem"))]
                     fn padding_errors_surface() {
                         padding_is_reported::<$params>();
                     }

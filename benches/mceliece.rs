@@ -67,5 +67,32 @@ fn decapsulate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, keypair, encapsulate, decapsulate);
+fn decapsulate_prepared(c: &mut Criterion) {
+    let mut group = c.benchmark_group("decapsulate_prepared");
+
+    for &algorithm in Algorithm::enabled_algorithms() {
+        let mut rng = ChaCha8Rng::from_seed([13u8; 32]);
+        let (ek, dk) = algorithm.generate_keypair(&mut rng);
+        let (ct, _) = algorithm
+            .encapsulate(&ek, &mut rng)
+            .expect("a freshly generated key encapsulates");
+        let prepared = dk.prepare();
+        group.bench_with_input(
+            BenchmarkId::from_parameter(algorithm.name()),
+            &(prepared, ct),
+            |b, (prepared, ct)| {
+                b.iter(|| black_box(prepared.decapsulate(ct)));
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    keypair,
+    encapsulate,
+    decapsulate,
+    decapsulate_prepared
+);
 criterion_main!(benches);

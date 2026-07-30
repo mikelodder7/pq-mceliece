@@ -10,7 +10,8 @@
 //! vectors; the standards require this particular one, so the routine here reproduces the
 //! reference recursion exactly rather than choosing any valid encoding.
 
-use super::sort::sort_i32;
+use super::sort::sort_packed_i32_power_of_two as sort_packed_i32;
+use zeroize::Zeroizing;
 
 /// Apply one stride-`2^s` layer of conditional swaps to `p`, driven by packed control bits.
 ///
@@ -45,18 +46,20 @@ fn cbrecursion(
     step: usize,
     pi: &[i16],
     w: usize,
-    n: usize,
     temp: &mut [i32],
+    q_scratch: &mut [i16],
 ) {
     if w == 1 {
         out[pos >> 3] ^= (pi[0] as u8) << (pos & 7);
         return;
     }
+    let n = pi.len();
 
     // `q` carries the two half-size permutations into the recursive calls. The reference
-    // implementation aliases it into `temp`; keeping it separate costs `n` 16-bit values per
-    // live recursion level and removes the aliasing entirely.
-    let mut q = vec![0i16; n];
+    // implementation aliases it into `temp`; keeping it separate removes that alias. A
+    // depth-first traversal needs `n + n/2 + ... < 2n` values live, so one caller-provided
+    // arena serves the whole tree instead of allocating at every recursion node.
+    let (q, child_scratch) = q_scratch.split_at_mut(n);
 
     {
         let (a, b) = temp.split_at_mut(n);
@@ -66,7 +69,7 @@ fn cbrecursion(
         for x in 0..n {
             a[x] = (((pi[x] ^ 1) as i32) << 16) | (pi[x ^ 1] as i32);
         }
-        sort_i32(a); // a = (id << 16) + pibar
+        sort_packed_i32(a); // a = (id << 16) + pibar
 
         for x in 0..n {
             let px = a[x] & 0xffff;
@@ -78,12 +81,12 @@ fn cbrecursion(
         for (x, slot) in a.iter_mut().enumerate() {
             *slot = (*slot << 16) | (x as i32);
         }
-        sort_i32(a); // a = (id << 16) + pibar^-1
+        sort_packed_i32(a); // a = (id << 16) + pibar^-1
 
         for x in 0..n {
             a[x] = (a[x] << 16) + (b[x] >> 16);
         }
-        sort_i32(a); // a = (id << 16) + pibar^2
+        sort_packed_i32(a); // a = (id << 16) + pibar^2
 
         if w <= 10 {
             // Ten bits are enough to hold an index, so `p` and `c` share one 20-bit word.
@@ -96,12 +99,12 @@ fn cbrecursion(
                 for (x, slot) in a.iter_mut().enumerate() {
                     *slot = ((b[x] & !0x3ff) << 6) | (x as i32);
                 }
-                sort_i32(a); // a = (id << 16) + p^-1
+                sort_packed_i32(a); // a = (id << 16) + p^-1
 
                 for x in 0..n {
                     a[x] = (a[x] << 20) | b[x];
                 }
-                sort_i32(a); // a = (id << 20) + (pp << 10) + cp
+                sort_packed_i32(a); // a = (id << 20) + (pp << 10) + cp
 
                 for x in 0..n {
                     let ppcpx = a[x] & 0xfffff;
@@ -122,7 +125,7 @@ fn cbrecursion(
                 for (x, slot) in a.iter_mut().enumerate() {
                     *slot = (b[x] & !0xffff) | (x as i32);
                 }
-                sort_i32(a); // a = (id << 16) + p^-1
+                sort_packed_i32(a); // a = (id << 16) + p^-1
 
                 for x in 0..n {
                     a[x] = (a[x] << 16) | (b[x] & 0xffff);
@@ -133,14 +136,14 @@ fn cbrecursion(
                     for x in 0..n {
                         b[x] = (a[x] & !0xffff) | (b[x] >> 16);
                     }
-                    sort_i32(b); // b = (id << 16) + p^-2
+                    sort_packed_i32(b); // b = (id << 16) + p^-2
                     for x in 0..n {
                         b[x] = (b[x] << 16) | (a[x] & 0xffff);
                     }
                     // b = (p^-2 << 16) + c
                 }
 
-                sort_i32(a); // a = (id << 16) + cp
+                sort_packed_i32(a); // a = (id << 16) + cp
                 for x in 0..n {
                     let cpx = (b[x] & !0xffff) | (a[x] & 0xffff);
                     b[x] = b[x].min(cpx);
@@ -154,7 +157,7 @@ fn cbrecursion(
         for (x, slot) in a.iter_mut().enumerate() {
             *slot = ((pi[x] as i32) << 16) + (x as i32);
         }
-        sort_i32(a); // a = (id << 16) + pi^-1
+        sort_packed_i32(a); // a = (id << 16) + pi^-1
 
         // The first output layer: `f`, one bit per pair.
         for j in 0..n / 2 {
@@ -169,7 +172,7 @@ fn cbrecursion(
             b[x] = (a[x] << 16) | fx;
             b[x + 1] = (a[x + 1] << 16) | fx1;
         }
-        sort_i32(b); // b = (id << 16) + F(pi)
+        sort_packed_i32(b); // b = (id << 16) + F(pi)
 
         // Skip past the bits that the recursive calls will fill in.
         pos += (2 * w - 3) * step * (n / 2);
@@ -187,7 +190,7 @@ fn cbrecursion(
             a[y] = (ly << 16) | (b[y] & 0xffff);
             a[y + 1] = (ly1 << 16) | (b[y + 1] & 0xffff);
         }
-        sort_i32(a); // a = (id << 16) + M
+        sort_packed_i32(a); // a = (id << 16) + M
 
         pos -= (2 * w - 2) * step * (n / 2);
 
@@ -198,8 +201,8 @@ fn cbrecursion(
     }
 
     let (lower, upper) = q.split_at(n / 2);
-    cbrecursion(out, pos, step * 2, lower, w - 1, n / 2, temp);
-    cbrecursion(out, pos + step, step * 2, upper, w - 1, n / 2, temp);
+    cbrecursion(out, pos, step * 2, lower, w - 1, temp, child_scratch);
+    cbrecursion(out, pos + step, step * 2, upper, w - 1, temp, child_scratch);
 }
 
 /// Compute the `(2w-1)2^(w-1)` control bits realizing the permutation `pi` of `0..2^w`.
@@ -213,11 +216,12 @@ pub(crate) fn control_bits_from_permutation(out: &mut [u8], pi: &[i16], w: usize
     debug_assert_eq!(out.len(), ((2 * w - 1) * (n / 2)).div_ceil(8));
 
     out.fill(0);
-    let mut temp = vec![0i32; 2 * n];
-    cbrecursion(out, 0, 1, pi, w, n, &mut temp);
+    let mut temp = Zeroizing::new(vec![0i32; 2 * n]);
+    let mut q_scratch = Zeroizing::new(vec![0i16; 2 * n]);
+    cbrecursion(out, 0, 1, pi, w, &mut temp, &mut q_scratch);
 
     // Replay the network over the identity and confirm it lands on `pi`.
-    let mut probe: Vec<i16> = (0..n as i16).collect();
+    let mut probe = Zeroizing::new((0..n as i16).collect::<Vec<i16>>());
     let mut offset = 0;
     for s in (0..w).chain((0..w - 1).rev()) {
         layer_i16(&mut probe, out, offset, s);

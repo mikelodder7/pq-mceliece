@@ -38,12 +38,17 @@ let (ek, dk) = alg.generate_keypair_from_seed([0x42u8; 32])?;
 When the parameter set is known at compile time, the `hazmat` layer puts it in the type, so a
 key from one parameter set cannot be passed to another:
 
-```rust,ignore
+```rust
 use pq_mceliece::hazmat::{Kem, McEliece8192128f};
+# use rand::rngs::SysRng;
+# use rand_core::UnwrapErr;
 
-let (ek, dk) = McEliece8192128f::generate_keypair(rng);
-let (ct, sent) = McEliece8192128f::encapsulate(&ek, rng)?;
+let (ek, dk) = McEliece8192128f::generate_keypair(UnwrapErr(SysRng));
+let (ct, sent) = McEliece8192128f::encapsulate(&ek, UnwrapErr(SysRng))?;
 let received = McEliece8192128f::decapsulate(&dk, &ct)?;
+
+assert_eq!(sent, received);
+# Ok::<(), pq_mceliece::Error>(())
 ```
 
 The `kem` module implements the [`kem`](https://docs.rs/kem) crate traits for every parameter
@@ -84,7 +89,7 @@ Parameter sets and operations are selected independently.
 | `keygen` | `KeyGen` and `SeededKeyGen` |
 | `encapsulate` | `Encap` |
 | `decapsulate` | `Decap` |
-| `kem` | the [`kem`](https://docs.rs/kem) crate traits; implies all three operations |
+| `kem` | the [`kem`](https://docs.rs/kem) crate traits; implies all three operations. Those traits pass keys as fixed-size arrays by value, and a Classic McEliece encapsulation key runs to 1.3 MB, so exporting or importing one needs a thread stack well above the 2 MiB default. Encapsulation and decapsulation are unaffected. See the `kem` module documentation. |
 | `serde` | serialization for every value type |
 | `hazmat` | makes the low-level, parameter-set-typed layer public |
 
@@ -117,7 +122,33 @@ rustflags = ["-C", "target-feature=+pclmulqdq"]   # x86-64
 
 On AArch64 the equivalent instruction is enabled by default on most targets.
 
-Run `cargo bench` for numbers on your own machine.
+### Decapsulating repeatedly under one key
+
+Roughly a third of a decapsulation depends only on the private key rather than on the message.
+A holder that decapsulates many ciphertexts under one key can do that part once:
+
+```rust
+use pq_mceliece::Algorithm;
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
+
+let alg = Algorithm::McEliece8192128f;
+let (ek, dk) = alg.generate_keypair(UnwrapErr(SysRng));
+let prepared = dk.prepare();
+
+for _ in 0..10 {
+    let (ct, sent) = alg.encapsulate(&ek, UnwrapErr(SysRng)).unwrap();
+    assert_eq!(prepared.decapsulate(&ct).unwrap(), sent);
+}
+```
+
+The result is identical to `dk.decapsulate(&ct)`, including for ciphertexts that fail to decode.
+The precomputed material is as sensitive as the private key: it is zeroized on drop and is
+deliberately not serializable, so store the `DecapsulationKey` and prepare again after loading
+it. Preparing to decapsulate a single message is not worth it.
+
+Run `cargo bench` for numbers on your own machine; the `decapsulate` and `decapsulate_prepared`
+groups measure the two paths.
 
 ## Conformance
 

@@ -5,13 +5,17 @@
 //! Key generation: `FieldOrdering`, `MatGen` and `SeededKeyGen`.
 
 use shake::digest::{ExtendableOutput, Update};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::controlbits::control_bits_from_permutation;
+use super::fft::{TransformWorkspace, eval_all_bitrev_sliced, sliced_words};
 use super::field::Field;
 use super::matrix::BitMatrix;
 use super::params::Params;
-use super::poly::{eval_many, minimal_polynomial};
+use super::poly::minimal_polynomial;
 use super::sort::sort_u64;
+use super::vec::{LANES, MAX_BITS, Slice, Tables, Word};
+use ctutils::{Choice, CtAssign, CtSelect};
 
 /// The domain separator prefixed to `delta` before expansion, as required by `PRG`.
 const PRG_PREFIX: u8 = 64;
@@ -38,6 +42,60 @@ fn same_mask(x: u16, y: u16) -> u64 {
     0u64.wrapping_sub(mask)
 }
 
+/// Evaluate `g` over the whole field and replace every value with its inverse.
+///
+/// The polynomial reaching `MatGen` is irreducible, so none of its evaluations is zero.
+/// Montgomery's trick reduces one bit-sliced inversion per group to one inversion total plus
+/// three multiplications per group. The output remains bit-sliced so the arithmetic and its
+/// memory access pattern are independent of the polynomial.
+fn inverse_evaluations<P: Params>(out: &mut [Word], goppa: &[u16]) {
+    debug_assert_eq!(out.len(), sliced_words::<P>());
+    debug_assert_eq!(goppa.len(), P::T);
+
+    let mut monic = Zeroizing::new(vec![0u16; P::T + 1]);
+    monic[..P::T].copy_from_slice(goppa);
+    monic[P::T] = 1;
+
+    let tables = Tables::<P::Field>::new();
+    let mut workspace = TransformWorkspace::new::<P>();
+    eval_all_bitrev_sliced::<P>(out, &monic, &tables, &mut workspace);
+
+    let planes = P::M;
+    let groups = P::Q / LANES;
+    let mut prefixes = Zeroizing::new(vec![0; out.len()]);
+    let read = |src: &[Word], group: usize| -> Slice {
+        let mut value: Slice = [0; MAX_BITS];
+        value[..planes].copy_from_slice(&src[group * planes..group * planes + planes]);
+        value
+    };
+
+    let mut running = read(out, 0);
+    prefixes[..planes].copy_from_slice(&running[..planes]);
+    for group in 1..groups {
+        let evaluated = read(out, group);
+        let mut product: Slice = [0; MAX_BITS];
+        tables.mul(&mut product, &running, &evaluated);
+        running = product;
+        prefixes[group * planes..group * planes + planes].copy_from_slice(&running[..planes]);
+    }
+
+    let mut acc: Slice = [0; MAX_BITS];
+    tables.inv(&mut acc, &running);
+    for group in (1..groups).rev() {
+        let evaluated = read(out, group);
+        let prefix = read(&prefixes, group - 1);
+
+        let mut inverted: Slice = [0; MAX_BITS];
+        tables.mul(&mut inverted, &acc, &prefix);
+        out[group * planes..group * planes + planes].copy_from_slice(&inverted[..planes]);
+
+        let mut next: Slice = [0; MAX_BITS];
+        tables.mul(&mut next, &acc, &evaluated);
+        acc = next;
+    }
+    out[..planes].copy_from_slice(&acc[..planes]);
+}
+
 /// Bring the last `mu` pivots into place for a semi-systematic parameter set.
 ///
 /// Reducing `N` to `(mu, nu)`-semi-systematic form and then swapping column `i` with column
@@ -50,8 +108,8 @@ fn same_mask(x: u16, y: u16) -> u64 {
 /// retry with a fresh seed.
 fn move_columns<P: Params>(mat: &mut BitMatrix, pi: &mut [i16], pivots: &mut u64) -> bool {
     let window = P::PK_NROWS - P::MU;
-    let mut buf = [0u64; 64];
-    let mut pivot_column = [0u32; 32];
+    let mut buf = Zeroizing::new([0u64; 64]);
+    let mut pivot_column = Zeroizing::new([0u32; 32]);
 
     for (i, slot) in buf.iter_mut().take(P::MU).enumerate() {
         *slot = mat.read_window(window + i, window);
@@ -74,21 +132,24 @@ fn move_columns<P: Params>(mat: &mut BitMatrix, pi: &mut [i16], pivots: &mut u64
 
         for j in i + 1..P::MU {
             let mask = ((buf[i] >> s) & 1).wrapping_sub(1);
-            buf[i] ^= buf[j] & mask;
+            let sum = buf[i] ^ buf[j];
+            buf[i].ct_assign(&sum, Choice::from_u64_lsb(mask));
         }
         for j in i + 1..P::MU {
             let mask = 0u64.wrapping_sub((buf[j] >> s) & 1);
-            buf[j] ^= buf[i] & mask;
+            let sum = buf[j] ^ buf[i];
+            buf[j].ct_assign(&sum, Choice::from_u64_lsb(mask));
         }
     }
 
     // Apply the same column swaps to the support ordering.
     for j in 0..P::MU {
         for k in j + 1..P::NU {
-            let mut d = (pi[window + j] ^ pi[window + k]) as u64;
-            d &= same_mask(k as u16, pivot_column[j] as u16);
-            pi[window + j] ^= d as i16;
-            pi[window + k] ^= d as i16;
+            let left = pi[window + j];
+            let right = pi[window + k];
+            let choice = Choice::from_u64_lsb(same_mask(k as u16, pivot_column[j] as u16));
+            pi[window + j] = left.ct_select(&right, choice);
+            pi[window + k] = right.ct_select(&left, choice);
         }
     }
 
@@ -126,12 +187,22 @@ fn mat_gen<P: Params>(
     debug_assert_eq!(perm.len(), P::Q);
     debug_assert_eq!(pi.len(), P::Q);
 
-    // `FieldOrdering`: sort `(a_i, i)` lexicographically. Packing the pair into one integer
-    // makes the tie-free comparison a plain integer comparison, so the constant-time sorting
-    // network can be used directly.
-    let mut buf = vec![0u64; P::Q];
+    // Evaluate `1 / g(bitrev(i))` in bit-sliced form first, then attach each inverse to the
+    // corresponding `(a_i, i)` field-ordering entry. The permutation occupies the high bits,
+    // so the same integer sorting network both orders the support and carries the inverse
+    // evaluations into matching positions.
+    let mut evaluations = Zeroizing::new(vec![0; sliced_words::<P>()]);
+    inverse_evaluations::<P>(&mut evaluations, goppa);
+
+    let mut buf = Zeroizing::new(vec![0u64; P::Q]);
     for (i, slot) in buf.iter_mut().enumerate() {
-        *slot = ((perm[i] as u64) << 31) | (i as u64);
+        let group = i / LANES;
+        let lane = i % LANES;
+        let mut inverse = 0u64;
+        for plane in 0..P::M {
+            inverse |= (((evaluations[group * P::M + plane] >> lane) & 1) as u64) << plane;
+        }
+        *slot = ((perm[i] as u64) << 31) | (inverse << 16) | (i as u64);
     }
     sort_u64(&mut buf);
 
@@ -146,20 +217,17 @@ fn mat_gen<P: Params>(
     }
 
     // `alpha_i = bitrev(pi(i))`, using only the first `n` of the `q` support elements.
-    let support: Vec<u16> = pi[..P::N]
-        .iter()
-        .map(|&value| P::Field::bitrev(value as u16))
-        .collect();
+    let support = Zeroizing::new(
+        pi[..P::N]
+            .iter()
+            .map(|&value| P::Field::bitrev(value as u16))
+            .collect::<Vec<u16>>(),
+    );
 
     // Row `i` of the Goppa parity-check matrix is `alpha_j^i / g(alpha_j)`.
-    let mut monic = vec![0u16; P::T + 1];
-    monic[..P::T].copy_from_slice(goppa);
-    monic[P::T] = 1;
-
-    let mut inv = vec![0u16; P::N];
-    eval_many::<P>(&mut inv, &monic, &support);
-    for slot in inv.iter_mut() {
-        *slot = P::Field::inv(*slot);
+    let mut inv = Zeroizing::new(vec![0u16; P::N]);
+    for (slot, &packed) in inv.iter_mut().zip(buf.iter()) {
+        *slot = ((packed >> 16) as u16) & P::Field::MASK;
     }
 
     let mut mat = BitMatrix::zeros(P::PK_NROWS, P::N);
@@ -194,32 +262,43 @@ fn mat_gen<P: Params>(
         let first_word = row / 64;
 
         // Pull a nonzero pivot up from the rows below without branching on which one.
-        for k in row + 1..P::PK_NROWS {
-            let mask = 0u64.wrapping_sub(mat.bit(row, row) ^ mat.bit(k, row));
-            mat.add_row(row, k, mask, first_word);
-        }
+        mat.accumulate_pivot(row, row, first_word);
 
         if mat.bit(row, row) == 0 {
             // No pivot exists in this column: the matrix has no systematic form.
             return false;
         }
 
-        // One destination row at a time is not an oversight. This sweep is the single most
-        // expensive part of key generation and it already runs at about one vector operation
-        // per cycle, so the only thing left to cut is memory traffic. Driving four destinations
-        // together to load each pivot word once measured 7% slower, and precomputing the masks
-        // ahead of the sweep instead of reading each from the row it gates measured 19% slower
-        // because it adds a whole scattered pass over the matrix per pivot.
-        //
-        // Blocking over pivots, the usual answer, is not open to us either: `move_columns` runs
-        // partway through this loop and reads the half-eliminated matrix, so reordering pivots
-        // would change the keys the `f` variants produce.
-        for k in 0..P::PK_NROWS {
-            if k != row {
-                let mask = 0u64.wrapping_sub(mat.bit(k, row));
-                mat.add_row(k, row, mask, first_word);
-            }
+        // Forward elimination needs only the rows below the pivot. Deferring the rows above
+        // leaves `move_columns` unchanged: its window consists of the current and later rows,
+        // all of which have already had every earlier pivot cleared.
+        mat.clear_below(row, row, first_word);
+    }
+
+    // Back-substitute in blocks. Once consecutive pivot rows reduce each other to an identity
+    // block, all of their columns can be cleared from an earlier row in one pass. Sixteen rows
+    // measured fastest for the degree-96 and degree-119 matrices; eight wins for the other
+    // standardized shapes by keeping the source working set smaller.
+    let mut end = P::PK_NROWS;
+    if P::T == 96 || P::T == 119 {
+        while end >= 16 {
+            let start = end - 16;
+            mat.clear_above_block::<16>(start);
+            end = start;
         }
+    } else {
+        while end >= 8 {
+            let start = end - 8;
+            mat.clear_above_block::<8>(start);
+            end = start;
+        }
+    }
+    // Only the degree-119 shape leaves a short prefix (eleven rows). Processing it one pivot
+    // at a time avoids a dynamic block width in either hot monomorphization.
+    while end != 0 {
+        let start = end - 1;
+        mat.clear_above_block::<1>(start);
+        end = start;
     }
 
     for i in 0..P::PK_NROWS {
@@ -247,21 +326,21 @@ pub(crate) fn seeded_keypair<P: Params>(pk: &mut [u8], sk: &mut [u8], seed: &[u8
     let f_len = P::T * 2;
     let expansion_len = s_len + perm_len + f_len + 32;
 
-    let mut delta = *seed;
-    let mut expansion = vec![0u8; expansion_len];
-    let mut f = vec![0u16; P::T];
-    let mut goppa = vec![0u16; P::T];
-    let mut perm = vec![0u32; P::Q];
-    let mut pi = vec![0i16; P::Q];
+    let mut delta = Zeroizing::new(*seed);
+    let mut expansion = Zeroizing::new(vec![0u8; expansion_len]);
+    let mut f = Zeroizing::new(vec![0u16; P::T]);
+    let mut goppa = Zeroizing::new(vec![0u16; P::T]);
+    let mut perm = Zeroizing::new(vec![0u32; P::Q]);
+    let mut pi = Zeroizing::new(vec![0i16; P::Q]);
 
     loop {
         let mut prg = shake::Shake256::default();
         prg.update(&[PRG_PREFIX]);
-        prg.update(&delta);
+        prg.update(&delta[..]);
         prg.finalize_xof_into(&mut expansion);
 
         // The seed stored in the private key is the one that produced this attempt.
-        sk[..32].copy_from_slice(&delta);
+        sk[..32].copy_from_slice(&delta[..]);
         delta.copy_from_slice(&expansion[expansion_len - 32..]);
 
         for (i, slot) in f.iter_mut().enumerate() {
@@ -320,7 +399,6 @@ pub(crate) fn public_key_from_secret_key<P: Params>(sk: &[u8], pk: &mut [u8]) {
     let mut regenerated = vec![0u8; P::SECRET_KEY_LENGTH];
     seeded_keypair::<P>(pk, &mut regenerated, &seed);
 
-    use zeroize::Zeroize;
     seed.zeroize();
     regenerated.zeroize();
 }
@@ -329,6 +407,7 @@ pub(crate) fn public_key_from_secret_key<P: Params>(sk: &[u8], pk: &mut [u8]) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::hazmat::poly::eval_many;
 
     #[test]
     fn trailing_zeros_matches_the_intrinsic() {
@@ -410,6 +489,38 @@ mod tests {
         );
     }
 
+    /// `MatGen` must report the `⊥` outcome when the semi-systematic window is rank deficient,
+    /// so that key generation restarts instead of emitting a key with no systematic form. A
+    /// window of zeros is the extreme case: no column can supply a pivot.
+    ///
+    /// Only the `f` variants take this path; the others have no window to move.
+    fn move_columns_rejects_a_rank_deficient_window<P: Params>() {
+        if !P::SEMI_SYSTEMATIC {
+            return;
+        }
+
+        let mut mat = BitMatrix::zeros(P::PK_NROWS, P::N);
+        let mut pi = vec![0i16; P::Q];
+        let mut pivots = 0u64;
+        assert!(
+            !move_columns::<P>(&mut mat, &mut pi, &mut pivots),
+            "{} all-zero window",
+            P::NAME
+        );
+
+        // A window whose rows all repeat one column is equally deficient once that column is
+        // consumed, and it exercises the loop rather than failing on the first iteration.
+        let window = P::PK_NROWS - P::MU;
+        for i in 0..P::MU {
+            mat.write_window(window + i, window, 1);
+        }
+        assert!(
+            !move_columns::<P>(&mut mat, &mut pi, &mut pivots),
+            "{} repeated column",
+            P::NAME
+        );
+    }
+
     macro_rules! keygen_tests {
         ($($feature:literal => $mod_name:ident, $params:ty;)+) => {
             $(
@@ -417,6 +528,11 @@ mod tests {
                 mod $mod_name {
                     use super::*;
                     use crate::hazmat::params::*;
+
+                    #[test]
+                    fn rejects_rank_deficient_pivot_window() {
+                        move_columns_rejects_a_rank_deficient_window::<$params>();
+                    }
 
                     #[test]
                     fn keypair_is_consistent() {
