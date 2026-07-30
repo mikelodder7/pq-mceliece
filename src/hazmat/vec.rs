@@ -499,6 +499,9 @@ mod tests {
     /// standardized parameter sets only ever instantiate over `GF(2^12)`, since `t = 64` occurs
     /// only at `m = 12`. Its `GF(2^13)` path is therefore unreachable in practice and would
     /// otherwise never be run at all, so check it here against the scalar field directly.
+    ///
+    /// The 64-lane kernel itself only exists when decapsulation is compiled.
+    #[cfg(feature = "decapsulate")]
     fn mul64_matches_the_scalar_field<F: Field>(seed: u64) {
         const LANES_64: usize = u64::BITS as usize;
 
@@ -564,6 +567,7 @@ mod tests {
                     }
 
                     #[test]
+                    #[cfg(feature = "decapsulate")]
                     fn sixty_four_lane_multiply() {
                         mul64_matches_the_scalar_field::<$field>($seed ^ 5);
                     }

@@ -143,11 +143,13 @@ pub(crate) fn eval<P: Params>(f: &[u16], a: u16) -> u16 {
 /// at the latency of the field multiplier rather than its throughput. Evaluating several
 /// points in lockstep fills the pipeline; eight is enough to cover the latency of both the
 /// carry-less-multiply and the portable multiplier without running out of registers.
-#[cfg(test)]
+#[cfg(all(test, feature = "decapsulate"))]
 pub(crate) const EVAL_LANES: usize = 8;
 
 /// Scalar test oracle that evaluates `f` at every element of `support`.
-#[cfg(test)]
+///
+/// Only key generation's tests use this, and that module needs decapsulation compiled in.
+#[cfg(all(test, feature = "decapsulate"))]
 pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) {
     debug_assert_eq!(out.len(), support.len());
 

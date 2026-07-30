@@ -115,6 +115,11 @@ zeroize = { version = "1", features = ["simd"] }
 [target.'cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))'.dependencies]
 zeroize = "1"
 
+# `rand` is used only by the doctests in README.md and the crate documentation, which
+# `cargo-udeps` cannot see, so it reports a false positive without this.
+[package.metadata.cargo-udeps.ignore]
+development = ["rand"]
+
 [dev-dependencies]
 aes = "0.9"
 criterion = "0.8"
@@ -123,7 +128,6 @@ hybrid-array = "0.4"
 postcard = { version = "1.0", features = ["use-std"] }
 rand = { version = "0.10", features = ["sys_rng"] }
 rand_chacha = "0.10"
-rstest = "0.26"
 serde_bare = "0.5"
 serde_cbor = "0.11"
 serde_json = "1.0"

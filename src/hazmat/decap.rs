@@ -665,8 +665,10 @@ pub(crate) fn decode_prepared<P: Params>(
 /// `Decode`, deriving the key material it needs up front.
 ///
 /// See [`decode_prepared`] for the algorithm and for reusing that material across messages.
-/// Decapsulation derives the material at its own level, so only the tests want this shape.
-#[cfg(test)]
+/// Decapsulation derives the material at its own level, so only the tests want this shape,
+/// and those tests generate a key pair and a ciphertext, so they need both of those
+/// operations compiled in. This gate must track the test module's.
+#[cfg(all(test, feature = "keygen", feature = "encapsulate"))]
 pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     let mut scale = vec![0; scale_words::<P>()];
     let mut valid = vec![0u8; valid_bytes::<P>()];

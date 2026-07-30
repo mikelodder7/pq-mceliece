@@ -14,7 +14,7 @@
 //! smaller stride are handled by transposing the bit matrix first, which turns the low bits of
 //! a position index into word indices.
 
-#[cfg(test)]
+#[cfg(all(test, feature = "keygen"))]
 use super::field::Field;
 use super::params::Params;
 use super::transpose::transpose_64x64;
@@ -264,7 +264,7 @@ pub(crate) fn apply_benes<P: Params>(r: &mut [u8], bits: &[u8], reverse: bool) {
 ///
 /// The network is applied to the `m` bit-planes of the identity ordering; reading the planes
 /// back column-wise reassembles one field element per position.
-#[cfg(test)]
+#[cfg(all(test, feature = "keygen"))]
 pub(crate) fn support_gen<P: Params>(support: &mut [u16], cond: &[u8]) {
     debug_assert_eq!(support.len(), P::N);
     debug_assert_eq!(cond.len(), P::COND_BYTES);

@@ -323,6 +323,7 @@ impl<P: Params> Kem for P {}
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "hazmat", feature = "kem"))]
     use rand_core::SeedableRng;
 
     /// The typed constructors and `Kem` methods only exist when the low-level layer or the

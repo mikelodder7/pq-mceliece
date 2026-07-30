@@ -928,6 +928,7 @@ mod tests {
         let mut rng = Rng(seed);
         let tables = Tables::<P::Field>::new();
         let mut workspace = TransformWorkspace::new::<P>();
+        #[cfg(feature = "decapsulate")]
         let width = 2 * P::T;
 
         for degree in [1usize, P::T, P::T + 1] {
