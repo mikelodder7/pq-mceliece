@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Arithmetic in the binary fields `GF(2^12)` and `GF(2^13)`.
 //!
@@ -75,9 +75,10 @@ pub trait Field:
     }
 }
 
-/// Return `MASK` when `a == 0` and `0` otherwise.
+/// Return an all-ones mask (`0x1FFF`, covering either field's element width) when `a == 0`
+/// and `0` otherwise.
 ///
-/// The `MASK` return value (rather than `1`) lets callers use the result directly as an
+/// The mask return value (rather than `1`) lets callers use the result directly as an
 /// `AND` mask for constant-time selection.
 ///
 /// Decoding tests for zero by or-reducing bit-planes instead, so only key generation, which

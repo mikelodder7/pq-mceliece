@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Bit-sliced arithmetic over `F_q`.
 //!
@@ -63,6 +63,10 @@ pub(crate) struct Tables<F: Field> {
     fused: bool,
 }
 
+// Every invocation below is cfg-gated, so the definition must carry the union of those
+// gates: an x86-64 keygen-only build has no surviving invocation, and an unused macro is an
+// error under `-D warnings`.
+#[cfg(any(not(target_arch = "x86_64"), test, feature = "decapsulate"))]
 macro_rules! karatsuba_product {
     ($name:ident, $word:ty, $slice:ty, $split:expr, $upper:expr) => {
         #[inline(always)]

@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! x86 vector kernels for the bit-matrix elimination that dominates key generation.
 //!

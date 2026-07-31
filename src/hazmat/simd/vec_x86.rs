@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! The x86 form of the bit-sliced field multiplication.
 //!

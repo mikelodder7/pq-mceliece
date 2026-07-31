@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Statically typed keys, ciphertexts and shared secrets, and the [`Kem`] trait over them.
 //!
@@ -53,6 +53,10 @@ macro_rules! byte_value {
             pub const LENGTH: usize = P::$length;
 
             /// Parse a value from bytes, checking the length.
+            ///
+            /// The length is the only thing validated here. A key assembled from arbitrary
+            /// bytes is structurally unconstrained; using one degrades safely (decapsulation
+            /// falls back to implicit rejection) but produces no useful result.
             pub fn from_slice(bytes: &[u8]) -> McElieceResult<Self> {
                 if bytes.len() != Self::LENGTH {
                     return Err(Error::$error(bytes.len()));
@@ -67,6 +71,9 @@ macro_rules! byte_value {
             ///
             /// The bytes are moved out rather than copied, so a megabyte-scale encapsulation
             /// key does not get duplicated on the way to the caller.
+            ///
+            /// For secret types this moves the bytes out of the zeroize-on-drop wrapper: the
+            /// caller now owns a plain `Vec` and is responsible for scrubbing it.
             pub fn into_vec(mut self) -> Vec<u8> {
                 core::mem::take(&mut self.bytes)
             }

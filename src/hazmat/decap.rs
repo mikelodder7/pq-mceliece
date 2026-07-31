@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Decapsulation: syndrome computation, Berlekamp-Massey decoding and implicit rejection.
 
@@ -69,7 +69,7 @@ fn scaling<P: Params>(
 
     // Montgomery's trick: invert the product of every group once, then walk back to recover
     // the individual inverses with multiplications. An inversion costs about eleven
-    // multiplications here, so trading sixty four of them for one plus three per group is a
+    // multiplications here, so trading sixty-four of them for one plus three per group is a
     // large saving. Generated keys have no zero evaluations because `g` is irreducible, but
     // imported private keys are only length checked. Replacing zero lanes with one in the
     // running product and masking their outputs preserves the field's `inv(0) = 0` semantics
@@ -554,7 +554,7 @@ pub(crate) fn prepare<P: Params>(sk: &[u8], scale: &mut [Word], valid: &mut [u8]
 /// Returns an all-ones mask when decoding succeeded and an all-zeros mask otherwise. A mask
 /// rather than a `bool` keeps the caller's selection of `e` against the rejection string `s`
 /// free of any branch on secret data. On failure `e` holds an unspecified value that the
-/// caller must discard in favour of `s`.
+/// caller must discard in favor of `s`.
 ///
 /// The work happens in field-element order rather than code-position order. Support element
 /// `alpha_i` is `bitrev` of the permutation image of position `i`, so moving the received word

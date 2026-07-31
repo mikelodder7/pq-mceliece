@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! A pure Rust implementation of the Classic McEliece key encapsulation mechanism.
 //!
@@ -604,13 +604,25 @@ macro_rules! serde_impl {
 macro_rules! value_type {
     (
         $(#[$meta:meta])*
-        $name:ident, $from_method:ident, secret = $secret:literal
+        $name:ident, $from_method:ident, secret = $secret:literal, length = $length:ident
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Default)]
+        #[derive(Clone)]
         pub struct $name {
             pub(crate) algorithm: Algorithm,
             pub(crate) value: Vec<u8>,
+        }
+
+        impl Default for $name {
+            /// An all-zero value of the correct length for [`Algorithm::default`].
+            ///
+            /// A derived `Default` would produce an empty value that violates the length
+            /// invariant every constructor enforces, so this builds one that upholds it.
+            fn default() -> Self {
+                let algorithm = Algorithm::default();
+                let value = with_params!(&algorithm, P, { vec![0u8; P::$length] });
+                Self { algorithm, value }
+            }
         }
 
         impl $name {
@@ -672,22 +684,22 @@ macro_rules! value_type {
 
 value_type! {
     /// A Classic McEliece encapsulation (public) key.
-    EncapsulationKey, encapsulation_key_from_bytes, secret = false
+    EncapsulationKey, encapsulation_key_from_bytes, secret = false, length = PUBLIC_KEY_LENGTH
 }
 
 value_type! {
     /// A Classic McEliece decapsulation (private) key.
-    DecapsulationKey, decapsulation_key_from_bytes, secret = true
+    DecapsulationKey, decapsulation_key_from_bytes, secret = true, length = SECRET_KEY_LENGTH
 }
 
 value_type! {
     /// A Classic McEliece ciphertext.
-    Ciphertext, ciphertext_from_bytes, secret = false
+    Ciphertext, ciphertext_from_bytes, secret = false, length = CIPHERTEXT_LENGTH
 }
 
 value_type! {
     /// A Classic McEliece shared secret.
-    SharedSecret, shared_secret_from_bytes, secret = true
+    SharedSecret, shared_secret_from_bytes, secret = true, length = SHARED_SECRET_LENGTH
 }
 
 macro_rules! zeroize_on_drop {
@@ -738,9 +750,18 @@ impl From<&DecapsulationKey> for EncapsulationKey {
     ///
     /// This costs a full key generation.
     fn from(secret: &DecapsulationKey) -> Self {
-        secret
-            .algorithm
-            .encapsulation_key_from_decapsulation_key(secret)
+        with_params!(&secret.algorithm, P, {
+            match hazmat::DecapsulationKey::<P>::from_slice(&secret.value) {
+                Ok(typed) => EncapsulationKey {
+                    algorithm: secret.algorithm,
+                    value: hazmat::EncapsulationKey::<P>::from(&typed).into_vec(),
+                },
+                // Every constructor, including `Default`, upholds the length invariant for
+                // the key's own parameter set, so this arm is unreachable; produce the
+                // default rather than panic.
+                Err(_) => EncapsulationKey::default(),
+            }
+        })
     }
 }
 
@@ -1013,22 +1034,20 @@ impl Algorithm {
     }
 
     /// Recover an encapsulation key from a decapsulation key.
+    ///
+    /// The key must belong to this parameter set. Parameter sets within a size family share
+    /// their private-key length, so without this check a key from a sibling set would rerun
+    /// key generation under the wrong variant and yield a public key that does not match the
+    /// private key.
     #[cfg(feature = "keygen")]
     pub fn encapsulation_key_from_decapsulation_key(
         &self,
         key: &DecapsulationKey,
-    ) -> EncapsulationKey {
-        with_params!(self, P, {
-            match hazmat::DecapsulationKey::<P>::from_slice(&key.value) {
-                Ok(typed) => EncapsulationKey {
-                    algorithm: *self,
-                    value: hazmat::EncapsulationKey::<P>::from(&typed).into_vec(),
-                },
-                // A `DecapsulationKey` is only constructible through a length-checked
-                // constructor, so this arm means the value belongs to another parameter set.
-                Err(_) => EncapsulationKey::default(),
-            }
-        })
+    ) -> McElieceResult<EncapsulationKey> {
+        if key.algorithm != *self {
+            return Err(Error::AlgorithmMismatch);
+        }
+        Ok(EncapsulationKey::from(key))
     }
 
     /// Parse bytes as an encapsulation key for this parameter set.
@@ -1287,31 +1306,55 @@ mod tests {
 
     #[test]
     fn the_dynamic_api_rejects_default_values_without_panicking() {
+        // `Default` values are well-formed all-zero values of the correct length, so every
+        // operation completes without panicking: encapsulating to the zero key succeeds, and
+        // decapsulating with the zero key degrades to implicit rejection. `seed` and
+        // `prepare` used to panic on the old empty-value `Default`; they must not regress.
         let algorithm = Algorithm::default();
         let mut rng = rand_chacha::ChaCha8Rng::from_seed([6u8; 32]);
-        assert_eq!(
-            algorithm
-                .encapsulate(&EncapsulationKey::default(), &mut rng)
-                .unwrap_err(),
-            Error::InvalidEncapsulationKeyLength(0)
-        );
-        assert_eq!(
-            algorithm
-                .decapsulate(&DecapsulationKey::default(), &Ciphertext::default())
-                .unwrap_err(),
-            Error::InvalidDecapsulationKeyLength(0)
-        );
+        let (ct, _ss) = algorithm
+            .encapsulate(&EncapsulationKey::default(), &mut rng)
+            .unwrap();
 
-        let key = DecapsulationKey::from_bytes(
+        let key = DecapsulationKey::default();
+        assert_eq!(key.seed(), [0u8; 32]);
+        let plain = algorithm.decapsulate(&key, &ct).unwrap();
+        let prepared = key.prepare();
+        assert_eq!(prepared.decapsulate(&ct).unwrap(), plain);
+        assert!(algorithm.decapsulate(&key, &Ciphertext::default()).is_ok());
+
+        // Hand-assembled wrong-length values still produce errors rather than panics.
+        let empty = Ciphertext {
             algorithm,
-            vec![0; algorithm.params().decapsulation_key_length],
+            value: Vec::new(),
+        };
+        assert_eq!(
+            algorithm.decapsulate(&key, &empty).unwrap_err(),
+            Error::InvalidCiphertextLength(0)
+        );
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "keygen",
+        feature = "mceliece348864",
+        feature = "mceliece348864f"
+    ))]
+    fn public_key_recovery_rejects_a_key_from_a_sibling_parameter_set() {
+        // The `f` and non-`f` variants share their private-key length, so without the
+        // algorithm check this would rerun key generation under the wrong variant and
+        // silently return a public key that does not match the private key.
+        let algorithm = Algorithm::McEliece348864;
+        let sibling = DecapsulationKey::from_bytes(
+            Algorithm::McEliece348864f,
+            vec![0; Algorithm::McEliece348864f.params().decapsulation_key_length],
         )
         .unwrap();
         assert_eq!(
             algorithm
-                .decapsulate(&key, &Ciphertext::default())
+                .encapsulation_key_from_decapsulation_key(&sibling)
                 .unwrap_err(),
-            Error::InvalidCiphertextLength(0)
+            Error::AlgorithmMismatch
         );
     }
 

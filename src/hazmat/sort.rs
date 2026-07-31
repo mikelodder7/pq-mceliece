@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Constant-time sorting networks.
 //!
@@ -15,7 +15,7 @@
 /// signed sorter.
 #[inline]
 #[cfg(feature = "keygen")]
-const fn minmax_packed_i32(a: i32, b: i32) -> (i32, i32) {
+pub(crate) const fn minmax_packed_i32(a: i32, b: i32) -> (i32, i32) {
     let mask = a.wrapping_sub(b) >> 31;
     ((a & mask) | (b & !mask), (a & !mask) | (b & mask))
 }
@@ -145,7 +145,7 @@ macro_rules! sorter {
                 // chain stays in a register, which is why the loops are not swapped here:
                 // hoisting the chain outward and sweeping runs vectorizes the inner step but
                 // spills the carried value to memory, and measured slower at every width
-                // tried. Neighbouring indices are independent, though, so a fixed number of
+                // tried. Neighboring indices are independent, though, so a fixed number of
                 // them advance together. The width has to be a compile-time constant: with a
                 // runtime length the carried values spill to memory and the gain disappears.
                 //

@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! The Gao-Mateer additive FFT.
 //!
@@ -554,11 +554,11 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
             } else {
                 ((1 << take) - 1) << lane
             };
+            // The coefficients derive from the secret polynomial, so each bit becomes an
+            // all-zeros or all-ones word rather than a branch condition.
             let constant = coefficients[(base + lane) / span];
             for (i, slot) in words.iter_mut().take(bits).enumerate() {
-                if (constant >> i) & 1 == 1 {
-                    *slot |= mask;
-                }
+                *slot |= mask & Word::from((constant >> i) & 1).wrapping_neg();
             }
             lane += take;
         }

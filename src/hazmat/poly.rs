@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Polynomial arithmetic over `F_q`.
 //!
@@ -332,6 +332,12 @@ mod tests {
     /// `Irreducible` must report the `⊥` outcome when `beta` does not generate the whole field,
     /// since the caller's response is to restart with a fresh seed rather than to emit a key.
     /// A constant `f` makes `beta` a scalar, which generates only `GF(2)`.
+    #[cfg(any(
+        feature = "mceliece348864",
+        feature = "mceliece460896",
+        feature = "mceliece6960119",
+        feature = "mceliece8192128"
+    ))]
     fn minimal_polynomial_rejects_a_proper_subfield<P: Params>() {
         let mut out = vec![0u16; P::T];
 

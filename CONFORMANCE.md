@@ -145,7 +145,7 @@ compiled output.
 
 This source-level claim does not cover physical power or electromagnetic observation, template
 attacks, or fault injection. Published Classic McEliece attacks have targeted syndrome/FFT
-computation, Berlekamp--Massey, Goppa-polynomial loading, and Gaussian elimination under those
+computation, Berlekamp-Massey, Goppa-polynomial loading, and Gaussian elimination under those
 physical threat models. Deployments exposed to those attackers need separately evaluated
 masking, fault detection, and platform-specific countermeasures; this crate does not currently
 provide them.
@@ -163,8 +163,16 @@ other rather than only against the KAT vectors.
 | Carry-less multiply | `vmull_p64` when `aes` is enabled | portable convolution (measured: faster than `pclmulqdq` here) | 13-term convolution |
 
 Selection on x86-64 is a run-time decision made once per process from CPUID, cached in an
-atomic, and never data dependent. Setting `PQ_MCELIECE_DISABLE_SIMD` to a non-empty value forces
-the scalar path; the test suite runs under both settings and the results must be identical.
+atomic, and never data dependent. Setting `PQ_MCELIECE_DISABLE_SIMD` to a non-empty value
+forces the scalar row kernels and disables the fused multiply on x86-64 (the baseline SSE2
+field multiply and the AArch64 NEON kernels are unconditional); CI runs the test suite under
+both settings and the results must be identical, and the differential unit tests additionally
+check every vector kernel against its scalar twin inside one binary.
+
+The portable carry-less multiply is a fixed 13-term convolution built on integer
+multiplication. On mainstream CPUs integer multiply latency is operand independent; on the
+few embedded cores where it is not (early-terminating multipliers), the constant-time claim
+would need re-evaluation for that platform.
 
 ### Constant time under vectorization
 
@@ -208,12 +216,13 @@ pivots fell. It is removed; the row is applied unconditionally and masked. Remov
 free, because the conditions are roughly balanced and the skip almost never fired.
 
 **Declassified, as in the reference implementation:** `MatGen` returning `⊥` is observable. Key
-generation responds by restarting with a fresh seed, which is the specification's own behaviour,
+generation responds by restarting with a fresh seed, which is the specification's own behavior,
 and the vectorized code declassifies exactly the same predicate the scalar code did.
 
 **Statistical verification.** `tests/constant_time.rs` implements the `dudect` method (Reparaz,
 Balasch and Verbauwhede, DATE 2017): time two input classes interleaved, and compare them with
-Welch's t-statistic over progressively cropped samples. Run with
+Welch's t-statistic over progressively cropped samples. The `tests/` directory is not shipped
+in the crates.io package, so run this from a repository checkout:
 
 ```text
 cargo test --release --test constant_time -- --ignored --nocapture
@@ -242,6 +251,7 @@ reference implementation behaves identically.
 
 **What this audit is and is not.** It is a source-level classification of every branch in the
 changed code, disassembly spot checks confirming the multiply compiles to straight-line vector
-code, and the statistical tests above. It is not machine-checked. A compiler is entitled to introduce a branch where the source has none; the
-disassembly checks cover the hot kernels but not every path. Independent verification with a
-constant-time analysis tool is worth doing before this is relied on in an adversarial setting.
+code, and the statistical tests above. It is not machine-checked. A compiler is entitled to
+introduce a branch where the source has none; the disassembly checks cover the hot kernels but
+not every path. Independent verification with a constant-time analysis tool is worth doing
+before this is relied on in an adversarial setting.

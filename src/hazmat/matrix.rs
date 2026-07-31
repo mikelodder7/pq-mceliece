@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! A dense bit matrix over `F_2` stored as 64-bit words.
 //!
@@ -880,7 +880,7 @@ impl BitMatrix {
         }
     }
 
-    /// Overwrite the 64 bits of `row` starting at bit offset `bit`, leaving neighbours intact.
+    /// Overwrite the 64 bits of `row` starting at bit offset `bit`, leaving neighbors intact.
     #[inline]
     pub(crate) fn write_window(&mut self, row: usize, bit: usize, value: u64) {
         let base = row * self.stride + bit / 64;

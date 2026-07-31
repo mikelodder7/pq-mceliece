@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Conversion of a permutation into Beneš network control bits.
 //!
@@ -10,7 +10,7 @@
 //! vectors; the standards require this particular one, so the routine here reproduces the
 //! reference recursion exactly rather than choosing any valid encoding.
 
-use super::sort::sort_packed_i32_power_of_two as sort_packed_i32;
+use super::sort::{minmax_packed_i32, sort_packed_i32_power_of_two as sort_packed_i32};
 use zeroize::Zeroizing;
 
 /// Apply one stride-`2^s` layer of conditional swaps to `p`, driven by packed control bits.
@@ -73,7 +73,11 @@ fn cbrecursion(
 
         for x in 0..n {
             let px = a[x] & 0xffff;
-            let cx = px.min(x as i32);
+            // The operands derive from the secret permutation, so take the minimum with the
+            // sorting network's arithmetic mask rather than a comparison the compiler may
+            // lower to a branch. Both values fit in 16 bits, well under the helper's
+            // `0x3fff_ffff` overflow bound.
+            let cx = minmax_packed_i32(px, x as i32).0;
             b[x] = (px << 16) | cx;
         }
         // b = (p << 16) + c
@@ -109,7 +113,9 @@ fn cbrecursion(
                 for x in 0..n {
                     let ppcpx = a[x] & 0xfffff;
                     let ppcx = (a[x] & 0xffc00) | (b[x] & 0x3ff);
-                    b[x] = ppcx.min(ppcpx);
+                    // Secret-derived operands: arithmetic minimum, not `Ord::min`. Both fit
+                    // in 20 bits, under the helper's overflow bound.
+                    b[x] = minmax_packed_i32(ppcx, ppcpx).0;
                 }
             }
             for slot in b.iter_mut() {
@@ -146,7 +152,9 @@ fn cbrecursion(
                 sort_packed_i32(a); // a = (id << 16) + cp
                 for x in 0..n {
                     let cpx = (b[x] & !0xffff) | (a[x] & 0xffff);
-                    b[x] = b[x].min(cpx);
+                    // Secret-derived operands: arithmetic minimum, not `Ord::min`. The packed
+                    // values stay at or below `0x3fff_ffff`, the helper's overflow bound.
+                    b[x] = minmax_packed_i32(b[x], cpx).0;
                 }
             }
             for slot in b.iter_mut() {

@@ -4,6 +4,7 @@ on:
   pull_request:
     paths-ignore:
       - README.md
+      - CHANGELOG.md
       - CONFORMANCE.md
       - SECURITY.md
       - LICENSE-APACHE
@@ -13,6 +14,7 @@ on:
     branches: main
     paths-ignore:
       - README.md
+      - CHANGELOG.md
       - CONFORMANCE.md
       - SECURITY.md
       - LICENSE-APACHE
@@ -38,7 +40,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable
-      # Parameter set groups carry no operations, so each needs one selecting explicitly.
+      # Parameter set groups carry no operations, so each needs one selected explicitly.
       - run: cargo build --no-default-features --features=nist,keygen,encapsulate,decapsulate
       - run: cargo build --no-default-features --features=iso,keygen,encapsulate,decapsulate
       - run: cargo build --no-default-features --features=pc,keygen,encapsulate,decapsulate
@@ -80,6 +82,8 @@ jobs:
       - run: cargo build --all-features --benches --release --keep-going
       - run: cargo test --all-features --release
       - run: cargo test --no-default-features --features=nist,serde,keygen,encapsulate,decapsulate --release
+      # The scalar fallbacks must produce identical results with the vector kernels disabled.
+      - run: PQ_MCELIECE_DISABLE_SIMD=1 cargo test --all-features --release
 
   # The carry-less multiply paths are compiled out by default on x86-64, so build and test
   # them explicitly.
@@ -114,6 +118,32 @@ jobs:
           toolchain: stable
       - run: cargo test --all-features --release
       - run: cargo clippy --all --all-features --all-targets -- -D warnings
+
+  # 32-bit x86, 32-bit ARM, and the Thumb-2 instruction set. Everything else runs on 64-bit,
+  # so these are what prove the word-size assumptions and the SIMD cfg gating: i686 must fall
+  # back cleanly from the x86-64 kernels, and the two ARM targets differ only in whether the
+  # compiler emits the ARM or the Thumb encoding. `cross` runs the suite under QEMU, so the
+  # test step uses the same reduced parameter pair as `careful` — one m = 12 set and one
+  # m = 13 semi-systematic set — to keep emulated runtimes reasonable. The full-feature build
+  # still compiles every parameter set and the `kem` trait layer for each target.
+  cross:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - i686-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - thumbv7neon-unknown-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@cross
+      - run: cross build --target ${{ matrix.target }} --all-features --release
+      - run: cross test --target ${{ matrix.target }} --release --no-default-features --features=mceliece348864,mceliece6960119f,serde,keygen,encapsulate,decapsulate
 
   coverage:
     runs-on: ubuntu-latest

@@ -1,6 +1,6 @@
 /*
     Copyright Michael Lodder. All Rights Reserved.
-    SPDX-License-Identifier: Apache-2.0
+    SPDX-License-Identifier: Apache-2.0 OR MIT
 */
 //! Runtime CPU feature detection.
 //!
@@ -52,8 +52,10 @@ mod detect {
 
     /// Read the environment override, if the platform has one to read.
     ///
-    /// Setting `PQ_MCELIECE_DISABLE_SIMD` to any non-empty value forces the scalar path. The
-    /// differential tests use it to run both arms of every kernel inside one binary.
+    /// Setting `PQ_MCELIECE_DISABLE_SIMD` to any non-empty value forces the scalar row
+    /// kernels and disables the fused multiply. The variable is read once, when the first
+    /// operation runs, and the answer is cached for the life of the process. CI runs the
+    /// test suite under both settings and the results must be identical.
     fn disabled_by_environment() -> bool {
         std::env::var_os("PQ_MCELIECE_DISABLE_SIMD").is_some_and(|value| !value.is_empty())
     }

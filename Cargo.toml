@@ -1,12 +1,12 @@
 [package]
 authors = ["Michael Lodder <redmike7@gmail.com>"]
 categories = ["cryptography"]
-description = "A pure rust implementation of the Classic McEliece post-quantum KEM"
+description = "A pure Rust implementation of the Classic McEliece post-quantum KEM"
 documentation = "https://docs.rs/pq-mceliece"
 edition = "2024"
-exclude = ["tests/**", "benches/**", "examples/**", ".github/**"]
-homepage = "https://crates.io/crates/pq-mceliece"
-keywords = ["post", "quantum", "kem", "mceliece"]
+exclude = ["tests/**", "benches/**", "examples/**", ".github/**", "ISA.md"]
+homepage = "https://github.com/mikelodder7/pq-mceliece"
+keywords = ["post-quantum", "kem", "mceliece", "cryptography", "encryption"]
 license = "Apache-2.0 OR MIT"
 name = "pq-mceliece"
 readme = "README.md"
@@ -20,7 +20,7 @@ default = ["nist", "iso", "serde", "keygen", "encapsulate", "decapsulate", "kem"
 # and dependencies it uses. At least one must be enabled.
 #
 # Encapsulation is by far the lightest: it needs no field arithmetic beyond a mask, and none
-# of the matrix, sorting, Benes network or control-bit machinery.
+# of the matrix, sorting, Beneš network or control-bit machinery.
 keygen = ["dep:rand_core"]
 encapsulate = ["dep:rand_core"]
 decapsulate = []

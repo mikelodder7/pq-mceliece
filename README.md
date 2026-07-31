@@ -36,7 +36,8 @@ let (ek, dk) = alg.generate_keypair_from_seed([0x42u8; 32])?;
 ```
 
 When the parameter set is known at compile time, the `hazmat` layer puts it in the type, so a
-key from one parameter set cannot be passed to another:
+key from one parameter set cannot be passed to another. This layer is behind the `hazmat`
+feature, which is not enabled by default:
 
 ```rust
 use pq_mceliece::hazmat::{Kem, McEliece8192128f};
@@ -53,6 +54,13 @@ assert_eq!(sent, received);
 
 The `kem` module implements the [`kem`](https://docs.rs/kem) crate traits for every parameter
 set, so Classic McEliece can be used in generic code alongside other KEMs.
+
+A runnable example that round-trips every enabled parameter set lives in
+[`examples/round_trip.rs`](examples/round_trip.rs):
+
+```sh
+cargo run --release --example round_trip
+```
 
 ## Parameter sets
 
@@ -86,7 +94,7 @@ Parameter sets and operations are selected independently.
 | `iso` | the sixteen parameter sets in the ISO standard |
 | `pc` | the eight plaintext-confirmation parameter sets |
 | `mceliece...` | one parameter set each, for building only what you use |
-| `keygen` | `KeyGen` and `SeededKeyGen` |
+| `keygen` | `KeyGen` and `SeededKeyGen`, and recovering a public key from a private one |
 | `encapsulate` | `Encap` |
 | `decapsulate` | `Decap` |
 | `kem` | the [`kem`](https://docs.rs/kem) crate traits; implies all three operations. Those traits pass keys as fixed-size arrays by value, and a Classic McEliece encapsulation key runs to 1.3 MB, so exporting or importing one needs a thread stack well above the 2 MiB default. Encapsulation and decapsulation are unaffected. See the `kem` module documentation. |
@@ -116,7 +124,8 @@ generation. Generate keys rarely and keep them.
 
 **Build with the defaults.** A stock `cargo build --release` already reaches the vector kernels:
 on x86-64 they are selected at run time from CPUID, so no `RUSTFLAGS` and no `.cargo/config.toml`
-entry are needed. AArch64 uses NEON unconditionally.
+entry are needed. AArch64 uses NEON unconditionally; its carry-less multiply additionally uses
+`PMULL` when the `aes` target feature is enabled, which is the default on Apple targets.
 
 Two flags are worth *not* setting, both measured on a Zen 5 part:
 
@@ -180,7 +189,7 @@ Licensed under either of
 
 at your option.
 
-## Acknowledgements
+## Acknowledgments
 
 The Classic McEliece specification, reference implementation and known-answer tests are the
 work of the Classic McEliece team: Martin R. Albrecht, Daniel J. Bernstein, Tung Chou, Carlos
