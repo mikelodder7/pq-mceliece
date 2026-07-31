@@ -778,7 +778,7 @@ mod tests {
     fn from_tau_adic<F: Field>(digits: &[u16], point: u16) -> u16 {
         let tau = F::sq(point) ^ point;
         let mut acc = 0u16;
-        for pair in digits.chunks_exact(2).rev() {
+        for pair in digits.as_chunks::<2>().0.iter().rev() {
             acc = F::mul(acc, tau) ^ (pair[0] ^ F::mul(pair[1], point));
         }
         acc

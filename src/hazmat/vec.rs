@@ -57,6 +57,10 @@ pub(crate) type Slice64 = [u64; MAX_BITS];
 /// Bit-sliced arithmetic selected by field type.
 pub(crate) struct Tables<F: Field> {
     field: core::marker::PhantomData<F>,
+    /// Whether the fused `AND`/`XOR` multiply is available, decided once at construction so the
+    /// hot path never pays for the check.
+    #[cfg(target_arch = "x86_64")]
+    fused: bool,
 }
 
 macro_rules! karatsuba_product {
@@ -105,18 +109,99 @@ macro_rules! karatsuba_product {
     };
 }
 
+#[cfg(any(not(target_arch = "x86_64"), test))]
 karatsuba_product!(product12, Word, Slice, 6, 6);
+#[cfg(any(not(target_arch = "x86_64"), test))]
 karatsuba_product!(product13, Word, Slice, 7, 6);
 #[cfg(feature = "decapsulate")]
 karatsuba_product!(product12_64, u64, Slice64, 6, 6);
 #[cfg(feature = "decapsulate")]
 karatsuba_product!(product13_64, u64, Slice64, 7, 6);
 
+/// Multiply two bit-sliced groups lane by lane, portably.
+///
+/// The schoolbook convolution gives a product of degree up to `2m - 2`; the top half folds back
+/// through the standardized sparse field polynomial. Every operation is a word-wide `AND` or
+/// `XOR`, so all [`LANES`] lanes advance together. This is the reference the x86 kernel is
+/// checked against, and the implementation every non-x86 target runs.
+#[cfg(any(not(target_arch = "x86_64"), test))]
+pub(crate) fn portable_mul<const BITS: usize>(out: &mut Slice, a: &Slice, b: &Slice) {
+    let mut product = if BITS == 12 {
+        product12(a, b)
+    } else {
+        debug_assert_eq!(BITS, 13);
+        product13(a, b)
+    };
+
+    // Fold from the top so that each term is complete before it is folded. These are the two
+    // standardized field polynomials: z^12 = z^3 + 1 and z^13 = z^4 + z^3 + z + 1.
+    if BITS == 12 {
+        for d in (0..11).rev() {
+            let high = product[12 + d];
+            product[d + 3] ^= high;
+            product[d] ^= high;
+        }
+    } else {
+        for d in (0..12).rev() {
+            let high = product[13 + d];
+            product[d + 4] ^= high;
+            product[d + 3] ^= high;
+            product[d + 1] ^= high;
+            product[d] ^= high;
+        }
+    }
+
+    out[..BITS].copy_from_slice(&product[..BITS]);
+    out[BITS..].fill(0);
+}
+
+/// Square a bit-sliced group lane by lane, portably.
+///
+/// Squaring is `F_2`-linear in characteristic two, so it is just a fixed exclusive-or pattern
+/// across the words with no multiplication at all.
+#[cfg(any(not(target_arch = "x86_64"), test))]
+pub(crate) fn portable_sq<const BITS: usize>(out: &mut Slice, a: &Slice) {
+    let mut result = [0; MAX_BITS];
+    if BITS == 12 {
+        result[0] = a[0] ^ a[6];
+        result[1] = a[11];
+        result[2] = a[1] ^ a[7];
+        result[3] = a[6];
+        result[4] = a[2] ^ a[8] ^ a[11];
+        result[5] = a[7];
+        result[6] = a[3] ^ a[9];
+        result[7] = a[8];
+        result[8] = a[4] ^ a[10];
+        result[9] = a[9];
+        result[10] = a[5] ^ a[11];
+        result[11] = a[10];
+    } else {
+        debug_assert_eq!(BITS, 13);
+        let t = a[11] ^ a[12];
+        result[0] = a[0] ^ a[11];
+        result[1] = a[7] ^ t;
+        result[2] = a[1] ^ a[7];
+        result[3] = a[8] ^ t;
+        result[4] = a[2] ^ a[7] ^ a[8] ^ t;
+        result[5] = a[7] ^ a[9];
+        result[6] = a[3] ^ a[8] ^ a[9] ^ a[12];
+        result[7] = a[8] ^ a[10];
+        result[8] = a[4] ^ a[9] ^ a[10];
+        result[9] = a[9] ^ a[11];
+        result[10] = a[5] ^ a[10] ^ a[11];
+        result[11] = a[10] ^ a[12];
+        result[12] = a[6] ^ t;
+    }
+    *out = result;
+}
+
 impl<F: Field> Tables<F> {
     /// Select the field arithmetic at compile time.
     pub(crate) fn new() -> Self {
         Self {
             field: core::marker::PhantomData,
+            #[cfg(target_arch = "x86_64")]
+            fused: crate::hazmat::simd::vec_x86::has_fused_and_xor(),
         }
     }
 
@@ -127,36 +212,44 @@ impl<F: Field> Tables<F> {
     /// `AND` or `XOR`, so
     /// all [`LANES`] lanes advance together.
     pub(crate) fn mul(&self, out: &mut Slice, a: &Slice, b: &Slice) {
-        let bits = F::BITS;
-        let mut product = if F::BITS == 12 {
-            product12(a, b)
-        } else {
-            debug_assert_eq!(F::BITS, 13);
-            product13(a, b)
-        };
-
-        // Fold from the top so that each term is complete before it is folded. These are the
-        // two standardized field polynomials:
-        // z^12 = z^3 + 1 and z^13 = z^4 + z^3 + z + 1.
-        if F::BITS == 12 {
-            for d in (0..11).rev() {
-                let high = product[12 + d];
-                product[d + 3] ^= high;
-                product[d] ^= high;
-            }
-        } else {
-            debug_assert_eq!(F::BITS, 13);
-            for d in (0..12).rev() {
-                let high = product[13 + d];
-                product[d + 4] ^= high;
-                product[d + 3] ^= high;
-                product[d + 1] ^= high;
-                product[d] ^= high;
+        // `BITS` is threaded as a constant rather than read from `F` at run time. This is the
+        // crate's hottest routine -- Berlekamp-Massey calls it three times per iteration for 2t
+        // iterations, and the additive transform's butterflies call it again -- and letting the
+        // field width fold away at compile time measured 16% off a whole decapsulation.
+        #[cfg(target_arch = "x86_64")]
+        {
+            // On x86 the planes go in vector registers explicitly; see `simd::vec_x86` for why
+            // `u128` does not get there on its own. The `sse2` form needs no detection -- it is
+            // baseline -- while the fused form needs `avx512vl` and so is selected from the flag
+            // this `Tables` recorded when it was built.
+            use crate::hazmat::simd::vec_x86;
+            if self.fused {
+                // SAFETY: `fused` was set from a CPUID probe, so `avx512f` and `avx512vl` are
+                // both present. `out` is a `&mut` borrow and cannot alias either operand.
+                unsafe {
+                    if F::BITS == 12 {
+                        vec_x86::mul_fused::<12>(out, a, b);
+                    } else {
+                        debug_assert_eq!(F::BITS, 13);
+                        vec_x86::mul_fused::<13>(out, a, b);
+                    }
+                }
+            } else if F::BITS == 12 {
+                vec_x86::mul::<12>(out, a, b);
+            } else {
+                debug_assert_eq!(F::BITS, 13);
+                vec_x86::mul::<13>(out, a, b);
             }
         }
-
-        out[..bits].copy_from_slice(&product[..bits]);
-        out[bits..].fill(0);
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            if F::BITS == 12 {
+                portable_mul::<12>(out, a, b);
+            } else {
+                debug_assert_eq!(F::BITS, 13);
+                portable_mul::<13>(out, a, b);
+            }
+        }
     }
 
     /// Multiply two 64-lane bit-sliced groups lane by lane.
@@ -199,39 +292,21 @@ impl<F: Field> Tables<F> {
     /// Squaring is `F_2`-linear in characteristic two, so it is just a fixed exclusive-or
     /// pattern across the words with no multiplication at all.
     pub(crate) fn sq(&self, out: &mut Slice, a: &Slice) {
-        let mut result = [0; MAX_BITS];
+        #[cfg(target_arch = "x86_64")]
         if F::BITS == 12 {
-            result[0] = a[0] ^ a[6];
-            result[1] = a[11];
-            result[2] = a[1] ^ a[7];
-            result[3] = a[6];
-            result[4] = a[2] ^ a[8] ^ a[11];
-            result[5] = a[7];
-            result[6] = a[3] ^ a[9];
-            result[7] = a[8];
-            result[8] = a[4] ^ a[10];
-            result[9] = a[9];
-            result[10] = a[5] ^ a[11];
-            result[11] = a[10];
+            crate::hazmat::simd::vec_x86::sq::<12>(out, a);
         } else {
             debug_assert_eq!(F::BITS, 13);
-            let t = a[11] ^ a[12];
-            result[0] = a[0] ^ a[11];
-            result[1] = a[7] ^ t;
-            result[2] = a[1] ^ a[7];
-            result[3] = a[8] ^ t;
-            result[4] = a[2] ^ a[7] ^ a[8] ^ t;
-            result[5] = a[7] ^ a[9];
-            result[6] = a[3] ^ a[8] ^ a[9] ^ a[12];
-            result[7] = a[8] ^ a[10];
-            result[8] = a[4] ^ a[9] ^ a[10];
-            result[9] = a[9] ^ a[11];
-            result[10] = a[5] ^ a[10] ^ a[11];
-            result[11] = a[10] ^ a[12];
-            result[12] = a[6] ^ t;
+            crate::hazmat::simd::vec_x86::sq::<13>(out, a);
         }
 
-        *out = result;
+        #[cfg(not(target_arch = "x86_64"))]
+        if F::BITS == 12 {
+            portable_sq::<12>(out, a);
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            portable_sq::<13>(out, a);
+        }
     }
 
     /// Multiply a bit-sliced group by a single field element in every lane.

@@ -247,7 +247,34 @@ fn mat_gen<P: Params>(
     }
 
     // Reduce to systematic form, taking the semi-systematic detour at the last `mu` rows.
-    for row in 0..P::PK_NROWS {
+    //
+    // The bulk of the forward sweep runs in blocked panels: sixteen consecutive pivots are
+    // established together and then applied to every trailing row in a single streaming pass,
+    // rather than streaming the whole matrix once per pivot. The rows this leaves behind are
+    // bit-identical to the row-at-a-time schedule -- see `BitMatrix::eliminate_panel`.
+    //
+    // Panels stop short of the semi-systematic detour so that `move_columns` still sees the
+    // matrix in exactly the state it expects, and the ragged tail is finished one pivot at a
+    // time because a panel needs its whole width.
+    const PANEL: usize = 32;
+    let detour = if P::SEMI_SYSTEMATIC {
+        P::PK_NROWS - P::MU
+    } else {
+        P::PK_NROWS
+    };
+    let mut panelled = 0;
+    {
+        let mut shadow = Zeroizing::new(vec![0u64; mat.rows()]);
+        let mut scratch = crate::hazmat::matrix::PanelScratch::new(mat.rows(), mat.stride(), PANEL);
+        while panelled + PANEL <= detour {
+            if !mat.eliminate_panel::<PANEL>(panelled, &mut shadow, &mut scratch) {
+                return false;
+            }
+            panelled += PANEL;
+        }
+    }
+
+    for row in panelled..P::PK_NROWS {
         if P::SEMI_SYSTEMATIC
             && row == P::PK_NROWS - P::MU
             && !move_columns::<P>(&mut mat, pi, pivots)

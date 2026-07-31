@@ -57,7 +57,7 @@ impl NistDrbg {
         let mut input = Block::default();
         let mut output = Block::default();
 
-        for chunk in temp.chunks_exact_mut(16) {
+        for chunk in temp.as_chunks_mut::<16>().0 {
             self.increment();
             input.copy_from_slice(&self.counter);
             enc.encrypt_block_b2b(&input, &mut output);

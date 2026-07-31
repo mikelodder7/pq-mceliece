@@ -51,11 +51,11 @@ pub(crate) fn fixed_weight<P: Params>(e: &mut [u8], mut rng: impl CryptoRng) {
         rng.fill_bytes(&mut bytes);
 
         let mut count = 0;
-        for chunk in bytes.chunks_exact(2) {
+        for pair in bytes.as_chunks::<2>().0 {
             if count == P::T {
                 break;
             }
-            let candidate = u16::from_le_bytes([chunk[0], chunk[1]]) & P::GFMASK;
+            let candidate = u16::from_le_bytes(*pair) & P::GFMASK;
             if (candidate as usize) < P::N {
                 indices[count] = candidate;
                 count += 1;
@@ -133,21 +133,22 @@ pub(crate) fn encode<P: Params>(syndrome: &mut [u8], pk: &[u8], e: &[u8]) {
     if P::PK_NROWS % 8 != 0 {
         syndrome[P::SYND_BYTES - 1] &= (1u8 << (P::PK_NROWS % 8)) - 1;
     }
-    for (i, row) in pk.chunks_exact(P::PK_ROW_BYTES).enumerate() {
+    // Indexed rather than chunked: the row length is an associated const of a type parameter,
+    // which cannot appear as a const-generic argument, and the row number is wanted anyway.
+    debug_assert_eq!(pk.len(), P::PK_NROWS * P::PK_ROW_BYTES);
+    for i in 0..P::PK_NROWS {
+        let row = &pk[i * P::PK_ROW_BYTES..(i + 1) * P::PK_ROW_BYTES];
         // Each whole word of the row is a fixed eight-byte copy, which compiles to one load.
         // Deriving the length per word instead, as a `min` against what is left of the row,
         // turns every one of them into a variable-length copy and costs an order of magnitude.
         let mut acc = 0u64;
-        let mut chunks = row.chunks_exact(8);
-        for (group, mask) in chunks.by_ref().zip(tail.iter()) {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(group);
-            acc ^= u64::from_le_bytes(buf) & mask;
+        let (groups, rest) = row.as_chunks::<8>();
+        for (group, mask) in groups.iter().zip(tail.iter()) {
+            acc ^= u64::from_le_bytes(*group) & mask;
         }
 
         // A row whose length is not a multiple of eight leaves a short tail, which pairs with
         // the last mask word. The length is a parameter set constant, never secret.
-        let rest = chunks.remainder();
         if !rest.is_empty() {
             let mut buf = [0u8; 8];
             buf[..rest.len()].copy_from_slice(rest);

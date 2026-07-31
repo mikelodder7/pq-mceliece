@@ -153,10 +153,10 @@ pub(crate) const EVAL_LANES: usize = 8;
 pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) {
     debug_assert_eq!(out.len(), support.len());
 
-    let mut chunks = out.chunks_exact_mut(EVAL_LANES);
-    let mut points = support.chunks_exact(EVAL_LANES);
+    let (groups, remaining_out) = out.as_chunks_mut::<EVAL_LANES>();
+    let (points, remaining_points) = support.as_chunks::<EVAL_LANES>();
 
-    for (dest, args) in chunks.by_ref().zip(points.by_ref()) {
+    for (dest, args) in groups.iter_mut().zip(points.iter()) {
         let mut acc = [f[P::T]; EVAL_LANES];
         for i in (0..P::T).rev() {
             let coefficient = f[i];
@@ -167,7 +167,7 @@ pub(crate) fn eval_many<P: Params>(out: &mut [u16], f: &[u16], support: &[u16]) 
         dest.copy_from_slice(&acc);
     }
 
-    for (dest, &a) in chunks.into_remainder().iter_mut().zip(points.remainder()) {
+    for (dest, &a) in remaining_out.iter_mut().zip(remaining_points) {
         *dest = eval::<P>(f, a);
     }
 }

@@ -112,15 +112,25 @@ the type-level constants up to `U1357824`, so it is a noticeable compile-time sa
 Classic McEliece has small ciphertexts, fast encapsulation, and large keys with expensive key
 generation. Generate keys rarely and keep them.
 
-To let the field arithmetic use carry-less multiply instructions, build with
-`-C target-cpu=native`, or add to `.cargo/config.toml`:
+### Build flags
 
-```toml
-[build]
-rustflags = ["-C", "target-feature=+pclmulqdq"]   # x86-64
-```
+**Build with the defaults.** A stock `cargo build --release` already reaches the vector kernels:
+on x86-64 they are selected at run time from CPUID, so no `RUSTFLAGS` and no `.cargo/config.toml`
+entry are needed. AArch64 uses NEON unconditionally.
 
-On AArch64 the equivalent instruction is enabled by default on most targets.
+Two flags are worth *not* setting, both measured on a Zen 5 part:
+
+- **`-C target-feature=+pclmulqdq`** makes key generation about 5% slower. The hardware
+  carry-less multiply needs the operands moved into a vector register and the result moved back,
+  and for the 13-bit field elements this crate multiplies, that round trip costs more latency
+  than the portable convolution costs throughput.
+- **`-C target-cpu=native`** was measured as a regression for decapsulation. Given AVX-512, LLVM
+  vectorizes the decoder's tight branch-free loops into code slower than what it replaced. The
+  kernels this crate ships are hand-written for the places where vectorization actually pays,
+  and they do not depend on the flag.
+
+If you benchmark a flag and it wins on your hardware, use it — but measure rather than assume,
+and measure with the machine otherwise idle.
 
 ### Decapsulating repeatedly under one key
 

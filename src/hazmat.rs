@@ -46,6 +46,14 @@ mod fft;
 mod matrix;
 #[cfg(feature = "keygen")]
 mod poly;
+// Runtime CPU feature detection and the vector kernels it selects between. Compiled only where
+// something consumes it, which today is the x86 bit-matrix elimination; widen this as kernels
+// for the other hot spots land.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(feature = "keygen", feature = "decapsulate")
+))]
+mod simd;
 #[cfg(any(feature = "keygen", feature = "encapsulate"))]
 mod sort;
 #[cfg(feature = "decapsulate")]
