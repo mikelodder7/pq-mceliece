@@ -32,9 +32,10 @@ Classic McEliece, as specified in:
 | `mceliece8192128pc`   | 13 | 8192 | 128 | (0, 0)   | yes | no  | yes |
 | `mceliece8192128pcf`  | 13 | 8192 | 128 | (32, 64) | yes | no  | yes |
 
-These eighteen sets are exactly the union of the ten in the NIST submission and the sixteen in
-the ISO standard. `mceliece348864` and `mceliece348864f` are NIST-only; the eight `pc` and
-`pcf` sets are ISO-only.
+These eighteen sets are exactly the union of the ten in the NIST submission (Classic McEliece
+was not selected as a NIST final standard) and the sixteen in the ISO standard.
+`mceliece348864` and `mceliece348864f` are NIST-only; the eight `pc` and `pcf` sets are
+ISO-only.
 
 ### Symmetric-cryptography parameters
 
@@ -125,8 +126,9 @@ are no lookup tables, no data-dependent shift amounts, and no early exits. Selec
 arithmetic masks throughout, including the two decision points in Berlekamp-Massey, the
 substitution of `s` for a failed decode, and the plaintext-confirmation comparison.
 
-Three conditions do influence control flow, and all three depend only on public data or on the
-key generation seed, matching the reference implementation's use of `crypto_declassify`:
+Three conditions do influence control flow, and each depends only on public data, the key
+generation seed, or randomness that is discarded, matching the reference implementation's use
+of `crypto_declassify`:
 
 - Key generation restarts when `Irreducible`, `FieldOrdering` or `MatGen` rejects its input.
   These depend on the seed alone, before any key exists.
@@ -140,7 +142,7 @@ decoding that follows differs only in reading that material rather than deriving
 material is a function of the decapsulation key alone and is treated as equally sensitive: it
 is zeroized on drop, kept out of the `Debug` output, and cannot be serialized.
 
-This crate has not been audited, and no formal constant-time verification has been run against
+This crate has not been independently audited, and no formal constant-time verification has been run against
 compiled output.
 
 This source-level claim does not cover physical power or electromagnetic observation, template
@@ -177,19 +179,12 @@ would need re-evaluation for that platform.
 ### Constant time under vectorization
 
 A vector kernel is only admissible if its instruction sequence and its memory access pattern
-depend on public values alone — lengths, strides, and parameter-set constants. Two consequences
-are worth stating because they cost performance:
-
-- A masked row XOR reads and writes every row whether its condition bit is zero or one. Skipping
-  the untaken rows would be faster and would leak which pivots were found where.
-- The blocked forward elimination deliberately does **not** use the Method of Four Russians. Its
-  precomputed-combination table would be indexed by secret matrix bits, which is a cache-timing
-  side channel. The panel keeps a shadow word per row instead and drives every decision from it
-  with masked XORs, so the only indices are row numbers and panel offsets.
-
-Secret conditions are turned into all-zero or all-one masks by wrapping negation and reach only
-the operand of an `AND`. On AVX-512 the mask is broadcast into a general vector lane rather than
-an opmask register, so no argument about predication timing is required.
+depend on public values alone — lengths, strides, and parameter-set constants. The audit
+section below spells out what that allows and forbids; the design consequence worth stating
+here is that it costs performance. Masked row operations touch every row whether their
+condition bit is set or not, and the blocked forward elimination keeps a shadow word per row
+rather than using the faster Method of Four Russians, because both shortcuts would trade a
+timing channel for the speed.
 
 ### Constant-time audit of the vectorized paths
 
@@ -212,8 +207,8 @@ allows and forbids, concretely:
 **One regression was found by this audit and fixed.** An early version of the blocked forward
 elimination skipped a trailing row whose conditions were all zero — `if any == 0 { continue }`.
 Those conditions derive from secret matrix bits, so the skip was a timing oracle for how the
-pivots fell. It is removed; the row is applied unconditionally and masked. Removing it measured
-free, because the conditions are roughly balanced and the skip almost never fired.
+pivots fell. It is removed; the row is applied unconditionally and masked. Removing it cost nothing
+measurable, because the conditions are roughly balanced and the skip almost never fired.
 
 **Declassified, as in the reference implementation:** `MatGen` returning `⊥` is observable. Key
 generation responds by restarting with a fresh seed, which is the specification's own behavior,

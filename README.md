@@ -4,6 +4,10 @@ A pure Rust implementation of the Classic McEliece post-quantum key encapsulatio
 
 [![crates.io](https://img.shields.io/crates/v/pq-mceliece.svg)](https://crates.io/crates/pq-mceliece)
 [![docs.rs](https://docs.rs/pq-mceliece/badge.svg)](https://docs.rs/pq-mceliece)
+[![CI](https://github.com/mikelodder7/pq-mceliece/actions/workflows/pq-mceliece.yml/badge.svg)](https://github.com/mikelodder7/pq-mceliece/actions/workflows/pq-mceliece.yml)
+[![downloads](https://img.shields.io/crates/d/pq-mceliece.svg)](https://crates.io/crates/pq-mceliece)
+[![license](https://img.shields.io/crates/l/pq-mceliece.svg)](#license)
+![rustc](https://img.shields.io/badge/rustc-1.88+-blue.svg)
 
 All eighteen standardized parameter sets are available at once. Choosing between
 `mceliece348864` and `mceliece8192128pcf` is a runtime decision, not a compile-time one.
@@ -12,12 +16,15 @@ All eighteen standardized parameter sets are available at once. Choosing between
 
 ```rust
 use pq_mceliece::Algorithm;
-use rand::rngs::SysRng;
-use rand_core::UnwrapErr;
+use rand::SeedableRng;
+use rand::rngs::{StdRng, SysRng};
 
-let alg = Algorithm::McEliece6960119f;
-let (ek, dk) = alg.generate_keypair(UnwrapErr(SysRng));
-let (ct, sent) = alg.encapsulate(&ek, UnwrapErr(SysRng))?;
+// A cryptographically secure generator, seeded once from the operating system.
+let mut rng = StdRng::try_from_rng(&mut SysRng).expect("OS randomness");
+
+let alg = Algorithm::RECOMMENDED; // McEliece6960119f
+let (ek, dk) = alg.generate_keypair(&mut rng);
+let (ct, sent) = alg.encapsulate(&ek, &mut rng)?;
 let received = alg.decapsulate(&dk, &ct)?;
 
 assert_eq!(sent, received);
@@ -25,7 +32,7 @@ assert_eq!(sent, received);
 ```
 
 Key generation is deterministic in a 32-byte seed, so a key pair can be rebuilt from backed-up
-seed material rather than from a megabyte of stored public key:
+seed material rather than from a stored key, trading speed for storage:
 
 ```rust
 use pq_mceliece::Algorithm;
@@ -41,11 +48,13 @@ feature, which is not enabled by default:
 
 ```rust
 use pq_mceliece::hazmat::{Kem, McEliece8192128f};
-# use rand::rngs::SysRng;
-# use rand_core::UnwrapErr;
+# use rand::SeedableRng;
+# use rand::rngs::{StdRng, SysRng};
 
-let (ek, dk) = McEliece8192128f::generate_keypair(UnwrapErr(SysRng));
-let (ct, sent) = McEliece8192128f::encapsulate(&ek, UnwrapErr(SysRng))?;
+let mut rng = StdRng::try_from_rng(&mut SysRng).expect("OS randomness");
+
+let (ek, dk) = McEliece8192128f::generate_keypair(&mut rng);
+let (ct, sent) = McEliece8192128f::encapsulate(&ek, &mut rng)?;
 let received = McEliece8192128f::decapsulate(&dk, &ct)?;
 
 assert_eq!(sent, received);
@@ -53,13 +62,30 @@ assert_eq!(sent, received);
 ```
 
 The `kem` module implements the [`kem`](https://docs.rs/kem) crate traits for every parameter
-set, so Classic McEliece can be used in generic code alongside other KEMs.
+set, so Classic McEliece can be used in generic code alongside other KEMs. The traits and the
+parameter-set marker types are re-exported there, so no direct dependency on the `kem` crate
+is needed:
 
-A runnable example that round-trips every enabled parameter set lives in
-[`examples/round_trip.rs`](examples/round_trip.rs):
+```rust
+use pq_mceliece::kem::{Decapsulate, Encapsulate, Kem, McEliece6960119f};
+# use rand::SeedableRng;
+# use rand::rngs::{StdRng, SysRng};
+
+let mut rng = StdRng::try_from_rng(&mut SysRng).expect("OS randomness");
+
+let (dk, ek) = McEliece6960119f::generate_keypair_from_rng(&mut rng);
+let (ct, sent) = ek.encapsulate_with_rng(&mut rng);
+assert_eq!(dk.decapsulate(&ct), sent);
+```
+
+Runnable examples live in [`examples/`](examples/): `round_trip` covers every enabled
+parameter set, `recommended` is the shortest sound configuration, and `kem_traits` shows
+KEM-generic code and large-key export:
 
 ```sh
 cargo run --release --example round_trip
+cargo run --release --example recommended
+cargo run --release --example kem_traits
 ```
 
 ## Parameter sets
@@ -82,7 +108,43 @@ Shared secrets are 32 bytes everywhere.
   drawn from the same distribution. Prefer it.
 - The **`pc`** suffix means plaintext confirmation, which adds a 32-byte hash of the error
   vector to the ciphertext. These sets are in the ISO standard only.
-- The Classic McEliece team recommends the `mceliece6*` sizes for long-term security.
+
+## Choosing a parameter set
+
+**Use `Algorithm::RECOMMENDED` (`mceliece6960119f`) unless something else decides for you.**
+The Classic McEliece team [recommends the `mceliece6*` sizes for long-term
+security](https://classic.mceliece.org/iso.html), and the `f` variants generate keys faster
+while drawing them from the same distribution.
+
+```rust
+use pq_mceliece::Algorithm;
+
+// Production: an mceliece6* size, per the Classic McEliece team's recommendation.
+let production = Algorithm::RECOMMENDED; // McEliece6960119f
+
+// Smallest ISO-standardized set, when the megabyte-class mceliece6* keys don't fit.
+let compact = Algorithm::McEliece460896f;
+
+// Power-of-two dimensions and no padding bits, at the cost of the largest key.
+let round = Algorithm::McEliece8192128f;
+
+// Research, testing, and interop with the NIST submission ONLY — see below.
+let research = Algorithm::McEliece348864f;
+# let _ = (production, compact, round, research);
+```
+
+**`mceliece348864` is for research and simple purposes, not production.** It exists because
+NIST asked the team for a Category 1 (lowest security floor) parameter set, and it carries
+the thinnest security margin of the family: the team's
+[CryptAttackTester](https://blog.cr.yp.to/20250423-mceliece.html) analysis puts the best
+known attacks — message recovery by information-set decoding — at about 2^150.59 bit
+operations, versus 2^190.50 for `mceliece460896` and above 2^257 for the `mceliece6*` sizes.
+The [ISO standard](https://classic.mceliece.org/iso.html) requires at least 128 bits of
+security in its quantum model, which credits attackers with a square-root Grover speedup;
+`mceliece348864` does not clear that bar and is excluded from the ISO standard, while
+`mceliece460896` was admitted because Grover's speedup is limited by attack latency.
+(Key-recovery attacks are not the concern — the team's analysis finds recovering a private
+key from a public key far slower than message recovery for every standardized set.)
 
 ## Features
 
@@ -148,17 +210,20 @@ A holder that decapsulates many ciphertexts under one key can do that part once:
 
 ```rust
 use pq_mceliece::Algorithm;
-use rand::rngs::SysRng;
-use rand_core::UnwrapErr;
+use rand::SeedableRng;
+use rand::rngs::{StdRng, SysRng};
+
+let mut rng = StdRng::try_from_rng(&mut SysRng).expect("OS randomness");
 
 let alg = Algorithm::McEliece8192128f;
-let (ek, dk) = alg.generate_keypair(UnwrapErr(SysRng));
+let (ek, dk) = alg.generate_keypair(&mut rng);
 let prepared = dk.prepare();
 
 for _ in 0..10 {
-    let (ct, sent) = alg.encapsulate(&ek, UnwrapErr(SysRng)).unwrap();
-    assert_eq!(prepared.decapsulate(&ct).unwrap(), sent);
+    let (ct, sent) = alg.encapsulate(&ek, &mut rng)?;
+    assert_eq!(prepared.decapsulate(&ct)?, sent);
 }
+# Ok::<(), pq_mceliece::Error>(())
 ```
 
 The result is identical to `dk.decapsulate(&ct)`, including for ciphertexts that fail to decode.
@@ -178,7 +243,7 @@ not claim.
 
 ## Security
 
-This crate has not been audited. See [SECURITY.md](SECURITY.md) for how to report a problem.
+This crate has not been independently audited. See [SECURITY.md](SECURITY.md) for how to report a problem.
 
 ## License
 

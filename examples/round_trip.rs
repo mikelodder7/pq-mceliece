@@ -12,17 +12,20 @@
 //! ```
 
 use pq_mceliece::Algorithm;
-use rand::rngs::SysRng;
-use rand_core::UnwrapErr;
+use rand::SeedableRng;
+use rand::rngs::{StdRng, SysRng};
 use std::time::Instant;
 
-fn main() -> Result<(), pq_mceliece::Error> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // A cryptographically secure generator, seeded once from the operating system.
+    let mut rng = StdRng::try_from_rng(&mut SysRng)?;
+
     for &alg in Algorithm::enabled_algorithms() {
         let start = Instant::now();
-        let (ek, dk) = alg.generate_keypair(UnwrapErr(SysRng));
+        let (ek, dk) = alg.generate_keypair(&mut rng);
         let keygen = start.elapsed();
 
-        let (ct, sent) = alg.encapsulate(&ek, UnwrapErr(SysRng))?;
+        let (ct, sent) = alg.encapsulate(&ek, &mut rng)?;
         let received = alg.decapsulate(&dk, &ct)?;
         assert_eq!(sent, received);
 

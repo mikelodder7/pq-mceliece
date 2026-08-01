@@ -6,6 +6,27 @@
 //!
 //! These wrap the [`hazmat`] layer in the fixed-size array types that the `kem`
 //! traits use, so Classic McEliece can be dropped into generic code alongside other KEMs.
+//! The traits and the parameter-set marker types are re-exported here, so no direct
+//! dependency on the `kem` crate is needed.
+//!
+//! # Example
+//!
+//! ```
+//! # #[cfg(feature = "mceliece6960119f")] {
+//! use pq_mceliece::kem::{Decapsulate, Encapsulate, Kem, McEliece6960119f};
+//! use rand::SeedableRng;
+//! use rand::rngs::{StdRng, SysRng};
+//!
+//! // A cryptographically secure generator, seeded once from the operating system.
+//! let mut rng = StdRng::try_from_rng(&mut SysRng).unwrap();
+//!
+//! let (dk, ek) = McEliece6960119f::generate_keypair_from_rng(&mut rng);
+//! let (ct, sent) = ek.encapsulate_with_rng(&mut rng);
+//! let received = dk.decapsulate(&ct);
+//!
+//! assert_eq!(sent, received);
+//! # }
+//! ```
 //!
 //! # Stack usage
 //!
@@ -35,14 +56,55 @@
 //! that comfortably exceeds twice the key size.
 
 use hybrid_array::{Array, ArraySize};
-use kem::{
-    Ciphertext, Decapsulate, Decapsulator, Encapsulate, Generate, InvalidKey, Key, KeyExport,
-    KeySizeUser, SharedKey, TryKeyInit,
+/// The [`kem`] crate's traits, re-exported so that callers need not depend on a
+/// version-matched copy of that crate themselves.
+pub use kem::{
+    Ciphertext, Decapsulate, Decapsulator, Encapsulate, Generate, InvalidKey, Kem, Key, KeyExport,
+    KeySizeUser, SharedKey, TryDecapsulate, TryKeyInit,
 };
 use rand_core::{CryptoRng, TryCryptoRng};
 use zeroize::Zeroizing;
 
 use crate::hazmat;
+
+/// The parameter-set marker types, re-exported so that code using these traits can name them
+/// without enabling the `hazmat` feature.
+#[cfg(feature = "mceliece348864")]
+pub use crate::hazmat::McEliece348864;
+#[cfg(feature = "mceliece348864f")]
+pub use crate::hazmat::McEliece348864f;
+#[cfg(feature = "mceliece460896")]
+pub use crate::hazmat::McEliece460896;
+#[cfg(feature = "mceliece460896f")]
+pub use crate::hazmat::McEliece460896f;
+#[cfg(feature = "mceliece460896pc")]
+pub use crate::hazmat::McEliece460896pc;
+#[cfg(feature = "mceliece460896pcf")]
+pub use crate::hazmat::McEliece460896pcf;
+#[cfg(feature = "mceliece6688128")]
+pub use crate::hazmat::McEliece6688128;
+#[cfg(feature = "mceliece6688128f")]
+pub use crate::hazmat::McEliece6688128f;
+#[cfg(feature = "mceliece6688128pc")]
+pub use crate::hazmat::McEliece6688128pc;
+#[cfg(feature = "mceliece6688128pcf")]
+pub use crate::hazmat::McEliece6688128pcf;
+#[cfg(feature = "mceliece6960119")]
+pub use crate::hazmat::McEliece6960119;
+#[cfg(feature = "mceliece6960119f")]
+pub use crate::hazmat::McEliece6960119f;
+#[cfg(feature = "mceliece6960119pc")]
+pub use crate::hazmat::McEliece6960119pc;
+#[cfg(feature = "mceliece6960119pcf")]
+pub use crate::hazmat::McEliece6960119pcf;
+#[cfg(feature = "mceliece8192128")]
+pub use crate::hazmat::McEliece8192128;
+#[cfg(feature = "mceliece8192128f")]
+pub use crate::hazmat::McEliece8192128f;
+#[cfg(feature = "mceliece8192128pc")]
+pub use crate::hazmat::McEliece8192128pc;
+#[cfg(feature = "mceliece8192128pcf")]
+pub use crate::hazmat::McEliece8192128pcf;
 
 fn array_from_slice<U: ArraySize>(bytes: &[u8]) -> Array<u8, U> {
     let mut array = Array::default();
@@ -51,7 +113,10 @@ fn array_from_slice<U: ArraySize>(bytes: &[u8]) -> Array<u8, U> {
 }
 
 /// Compile-time sizes used by the [`kem`] trait implementations.
-#[doc(hidden)]
+///
+/// Generic code over these traits names key types as `EncapsulationKey<K>` and
+/// `DecapsulationKey<K>`, both of which require `K` to implement this trait, so it is part
+/// of the public vocabulary even though every implementation lives in this crate.
 pub trait KemSizes:
     hazmat::Kem + Copy + Clone + core::fmt::Debug + Eq + Ord + Send + Sync + 'static
 {

@@ -4,12 +4,13 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.1.x   | yes       |
+| 0.2.x   | yes       |
+| 0.1.x   | no        |
 
 ## Reporting a Security Bug
 
 If you think you have discovered a security issue in any of the code, I'd love to hear from
-you. I take all security bugs seriously; if confirmed upon investigation I will patch it
+you. I take all security bugs seriously; once investigation confirms a bug, I will patch it
 within a reasonable amount of time, release a public security bulletin discussing the impact,
 and credit the discoverer.
 

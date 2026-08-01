@@ -54,9 +54,10 @@ macro_rules! byte_value {
 
             /// Parse a value from bytes, checking the length.
             ///
-            /// The length is the only thing validated here. A key assembled from arbitrary
-            /// bytes is structurally unconstrained; using one degrades safely (decapsulation
-            /// falls back to implicit rejection) but produces no useful result.
+            /// The length is the only thing validated here. A value assembled from arbitrary
+            /// bytes is structurally unconstrained; a malformed private key degrades safely,
+            /// with decapsulation falling back to implicit rejection, but produces no useful
+            /// result.
             pub fn from_slice(bytes: &[u8]) -> McElieceResult<Self> {
                 if bytes.len() != Self::LENGTH {
                     return Err(Error::$error(bytes.len()));

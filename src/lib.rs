@@ -5,8 +5,8 @@
 //! A pure Rust implementation of the Classic McEliece key encapsulation mechanism.
 //!
 //! Every enabled parameter set is available at once. Unlike implementations that bake a single
-//! parameter set into the crate through cargo features, choosing between `mceliece348864` and
-//! `mceliece8192128pcf` here is a runtime decision.
+//! parameter set into the crate through cargo features, this crate makes choosing between
+//! `mceliece348864` and `mceliece8192128pcf` a runtime decision.
 //!
 //! ## Usage
 //!
@@ -20,12 +20,15 @@
 //! #     feature = "decapsulate"
 //! # ))] {
 //! use pq_mceliece::Algorithm;
-//! use rand::rngs::SysRng;
-//! use rand_core::UnwrapErr;
+//! use rand::SeedableRng;
+//! use rand::rngs::{StdRng, SysRng};
+//!
+//! // A cryptographically secure generator, seeded once from the operating system.
+//! let mut rng = StdRng::try_from_rng(&mut SysRng).unwrap();
 //!
 //! let alg = Algorithm::McEliece348864f;
-//! let (ek, dk) = alg.generate_keypair(UnwrapErr(SysRng));
-//! let (ct, sent) = alg.encapsulate(&ek, UnwrapErr(SysRng)).unwrap();
+//! let (ek, dk) = alg.generate_keypair(&mut rng);
+//! let (ct, sent) = alg.encapsulate(&ek, &mut rng).unwrap();
 //! let received = alg.decapsulate(&dk, &ct).unwrap();
 //!
 //! assert_eq!(sent, received);
@@ -61,11 +64,13 @@
 //! #     feature = "decapsulate"
 //! # ))] {
 //! use pq_mceliece::hazmat::{Kem, McEliece348864};
-//! use rand::rngs::SysRng;
-//! use rand_core::UnwrapErr;
+//! use rand::SeedableRng;
+//! use rand::rngs::{StdRng, SysRng};
 //!
-//! let (ek, dk) = McEliece348864::generate_keypair(UnwrapErr(SysRng));
-//! let (ct, sent) = McEliece348864::encapsulate(&ek, UnwrapErr(SysRng)).unwrap();
+//! let mut rng = StdRng::try_from_rng(&mut SysRng).unwrap();
+//!
+//! let (ek, dk) = McEliece348864::generate_keypair(&mut rng);
+//! let (ct, sent) = McEliece348864::encapsulate(&ek, &mut rng).unwrap();
 //! let received = McEliece348864::decapsulate(&dk, &ct).unwrap();
 //!
 //! assert_eq!(sent, received);
@@ -92,6 +97,31 @@
 //! ignored. This only ever applies to `mceliece6960119`, the one standardized parameter set
 //! whose `mt` and `k` are not multiples of eight.
 //!
+//! ## Choosing a parameter set
+//!
+//! **Use [`Algorithm::RECOMMENDED`] (`mceliece6960119f`) unless something else decides for
+//! you.** The Classic McEliece team [recommends the `mceliece6*` sizes for long-term
+//! security](https://classic.mceliece.org/iso.html), and the `f` variants generate keys
+//! faster while drawing them from the same distribution.
+//!
+//! **`mceliece348864` is for research, testing, and interop only — not production.** It
+//! exists because NIST asked for a Category 1 (lowest security floor) parameter set, and it
+//! has the thinnest security margin of the family: the team's
+//! [CryptAttackTester](https://blog.cr.yp.to/20250423-mceliece.html) analysis puts the best
+//! known attacks — message recovery by information-set decoding — at about 2^150.59 bit
+//! operations, versus 2^190.50 for `mceliece460896` and above 2^257 for the `mceliece6*`
+//! sizes. The ISO standard requires at least 128 bits of security in its quantum model,
+//! which assumes a square-root Grover speedup; `mceliece348864` does not clear that bar and
+//! is [excluded from the ISO standard](https://classic.mceliece.org/iso.html), while
+//! `mceliece460896` was admitted because Grover's speedup is limited by attack latency.
+//! (Key-recovery attacks are not the concern: the team's analysis finds them far slower
+//! than message recovery for every standardized set.)
+//!
+//! In between, `mceliece460896` (NIST Category 3, ISO-standardized) is the smallest
+//! production-appropriate set, and `mceliece8192128` trades a larger key for power-of-two
+//! dimensions and no padding. The `pc` variants add plaintext confirmation where a protocol
+//! requires it.
+//!
 //! ## Conformance
 //!
 //! Every NIST parameter set is checked bit for bit against the published `kat_kem.rsp` known
@@ -106,7 +136,7 @@
 //!
 //! The three operations are `keygen`, `encapsulate` and `decapsulate`. At least one must be
 //! enabled, and a build only carries the code and dependencies the enabled ones reach.
-//! Encapsulation is much the lightest: `Encode` is pure bit manipulation over the public key,
+//! Encapsulation is by far the lightest: `Encode` is pure bit manipulation over the public key,
 //! so an encapsulate-only build contains no field arithmetic, no polynomial arithmetic, no
 //! matrix reduction, no sorting networks and no Beneš network.
 //!
@@ -167,10 +197,9 @@ compile_error!(
 #[cfg(all(
     doctest,
     feature = "hazmat",
-    feature = "keygen",
-    feature = "encapsulate",
-    feature = "decapsulate",
+    feature = "kem",
     feature = "mceliece348864f",
+    feature = "mceliece460896f",
     feature = "mceliece6960119f",
     feature = "mceliece8192128f"
 ))]
@@ -404,6 +433,21 @@ declare_algorithms! {
     "mceliece8192128pc" => McEliece8192128pc, 17;
     /// `mceliece8192128pcf`: plaintext confirmation and semi-systematic key generation.
     "mceliece8192128pcf" => McEliece8192128pcf, 18;
+}
+
+impl Algorithm {
+    /// The parameter set to use when nothing else decides it: [`McEliece6960119f`].
+    ///
+    /// The Classic McEliece team [recommends the `mceliece6*` sizes for long-term
+    /// security](https://classic.mceliece.org/iso.html), and `mceliece6960119` is the
+    /// original 1978-lineage size among them; the `f` variant generates keys faster and
+    /// draws them from the same distribution. See the crate documentation's *Choosing a
+    /// parameter set* section for how the alternatives compare, and why `mceliece348864`
+    /// is for research rather than production.
+    ///
+    /// [`McEliece6960119f`]: Algorithm::McEliece6960119f
+    #[cfg(feature = "mceliece6960119f")]
+    pub const RECOMMENDED: Algorithm = Algorithm::McEliece6960119f;
 }
 
 impl Default for Algorithm {
@@ -1036,9 +1080,9 @@ impl Algorithm {
     /// Recover an encapsulation key from a decapsulation key.
     ///
     /// The key must belong to this parameter set. Parameter sets within a size family share
-    /// their private-key length, so without this check a key from a sibling set would rerun
-    /// key generation under the wrong variant and yield a public key that does not match the
-    /// private key.
+    /// their private-key length, so without this check a key from a sibling set would be
+    /// accepted, rerunning key generation under the wrong variant and yielding a public key
+    /// that does not match the private key.
     #[cfg(feature = "keygen")]
     pub fn encapsulation_key_from_decapsulation_key(
         &self,
@@ -1332,6 +1376,13 @@ mod tests {
             algorithm.decapsulate(&key, &empty).unwrap_err(),
             Error::InvalidCiphertextLength(0)
         );
+    }
+
+    #[test]
+    #[cfg(feature = "mceliece6960119f")]
+    fn the_recommended_algorithm_is_an_enabled_mceliece6_set() {
+        assert_eq!(Algorithm::RECOMMENDED, Algorithm::McEliece6960119f);
+        assert!(Algorithm::enabled_algorithms().contains(&Algorithm::RECOMMENDED));
     }
 
     #[test]
