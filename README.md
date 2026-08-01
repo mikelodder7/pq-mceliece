@@ -7,7 +7,7 @@ A pure Rust implementation of the Classic McEliece post-quantum key encapsulatio
 [![CI](https://github.com/mikelodder7/pq-mceliece/actions/workflows/pq-mceliece.yml/badge.svg)](https://github.com/mikelodder7/pq-mceliece/actions/workflows/pq-mceliece.yml)
 [![downloads](https://img.shields.io/crates/d/pq-mceliece.svg)](https://crates.io/crates/pq-mceliece)
 [![license](https://img.shields.io/crates/l/pq-mceliece.svg)](#license)
-![rustc](https://img.shields.io/badge/rustc-1.88+-blue.svg)
+![rustc](https://img.shields.io/badge/rustc-1.89+-blue.svg)
 
 All eighteen standardized parameter sets are available at once. Choosing between
 `mceliece348864` and `mceliece8192128pcf` is a runtime decision, not a compile-time one.

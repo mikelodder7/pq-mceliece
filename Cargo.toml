@@ -11,7 +11,7 @@ license = "Apache-2.0 OR MIT"
 name = "pq-mceliece"
 readme = "README.md"
 repository = "https://github.com/mikelodder7/pq-mceliece"
-rust-version = "1.88"
+rust-version = "1.89"
 version = "0.2.0"
 
 [features]

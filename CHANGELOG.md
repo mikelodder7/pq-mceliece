@@ -16,7 +16,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   empty one, so `DecapsulationKey::default().seed()` and `.prepare()` no longer panic.
 - Examples and documentation construct a `StdRng` seeded once from the operating system
   instead of wrapping `SysRng` in `UnwrapErr`.
-- Declared `rust-version = "1.88"`.
+- Declared `rust-version = "1.89"`, the stabilization release of the AVX-512 intrinsics the
+  x86-64 kernels use.
 
 ### Added
 
