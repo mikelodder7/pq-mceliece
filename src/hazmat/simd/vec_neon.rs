@@ -18,9 +18,10 @@
 //!
 //! # Constant time
 //!
-//! `veorq_u64` and `vandq_u64` are fixed-latency, data-independent operations. The sequence
-//! and its length depend only on the field's extension degree, a compile-time constant of the
-//! parameter set. Nothing here branches on, or indexes with, a field element.
+//! `veorq_u64`, `vandq_u64` and -- on `sha3` targets -- `vbcaxq_u64` are fixed-latency,
+//! data-independent, memory-free logic operations. The sequence and its length depend only on
+//! the field's extension degree, a compile-time constant of the parameter set. Nothing here
+//! branches on, or indexes with, a field element.
 
 use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64};
 
