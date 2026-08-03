@@ -22,7 +22,7 @@
 //! and its length depend only on the field's extension degree, a compile-time constant of the
 //! parameter set. Nothing here branches on, or indexes with, a field element.
 
-use core::arch::aarch64::{uint64x2_t, vandq_u64, vdupq_n_u64, veorq_u64};
+use core::arch::aarch64::{uint64x2_t, vdupq_n_u64, veorq_u64};
 
 use crate::hazmat::vec::MAX_BITS;
 
@@ -44,8 +44,26 @@ fn from_vector(value: uint64x2_t) -> u128 {
 }
 
 /// `a ^ (b & c)`, the Karatsuba inner step.
+///
+/// With the `sha3` extension -- baseline on Apple silicon -- the step is one `BCAX`, whose
+/// shape is `a ^ (b & !c)`; [`mul`] pre-complements the `c` side once so the convolution's
+/// one hundred and thirty-four `AND`/`XOR` pairs become that many single instructions, the
+/// same fusion `vpternlogq` gives the x86 kernel. Without the extension the plain two-op
+/// form runs unchanged.
+#[cfg(target_feature = "sha3")]
+#[inline(always)]
+fn and_xor(a: uint64x2_t, b: uint64x2_t, not_c: uint64x2_t) -> uint64x2_t {
+    use core::arch::aarch64::vbcaxq_u64;
+    // SAFETY: the `cfg` above guarantees the `sha3` target feature, and the instruction
+    // does not touch memory.
+    unsafe { vbcaxq_u64(a, b, not_c) }
+}
+
+/// `a ^ (b & c)`, the Karatsuba inner step.
+#[cfg(not(target_feature = "sha3"))]
 #[inline(always)]
 fn and_xor(a: uint64x2_t, b: uint64x2_t, c: uint64x2_t) -> uint64x2_t {
+    use core::arch::aarch64::vandq_u64;
     // SAFETY: `neon` is part of the AArch64 baseline, so both intrinsics are unconditionally
     // present on this target. Neither touches memory.
     unsafe { veorq_u64(a, vandq_u64(b, c)) }
@@ -89,6 +107,20 @@ pub(crate) fn mul<const BITS: usize>(
         if u < s {
             a_sum[u] = av[u];
             b_sum[u] = bv[u];
+        }
+
+        // `BCAX` takes its third operand complemented, so complement the whole `b` side once
+        // -- twenty operations buying one op off each of the hundred-plus inner steps. There
+        // is no 64-bit `MVN` intrinsic; an exclusive-or with ones is the same one instruction.
+        #[cfg(target_feature = "sha3")]
+        {
+            let ones = vdupq_n_u64(u64::MAX);
+            for plane in bv.iter_mut().take(BITS) {
+                *plane = veorq_u64(*plane, ones);
+            }
+            for sum in b_sum.iter_mut().take(s) {
+                *sum = veorq_u64(*sum, ones);
+            }
         }
 
         let mut low = [zero; MAX_BITS];
