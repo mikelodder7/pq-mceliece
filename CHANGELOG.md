@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-03
+
+### Fixed
+
+- Links from the README and the crate documentation to repository files (conformance notes,
+  security policy, licenses, examples) are now absolute, so they resolve on crates.io and
+  docs.rs instead of only on GitHub.
+
 ## [0.2.0] - 2026-08-01
 
 ### Changed
@@ -56,5 +64,6 @@ Initial release.
   selected) and AArch64 (NEON), each checked against its scalar twin, plus a `dudect`
   statistical timing test suite.
 
+[0.2.1]: https://github.com/mikelodder7/pq-mceliece/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mikelodder7/pq-mceliece/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mikelodder7/pq-mceliece/releases/tag/v0.1.0

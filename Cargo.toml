@@ -12,7 +12,7 @@ name = "pq-mceliece"
 readme = "README.md"
 repository = "https://github.com/mikelodder7/pq-mceliece"
 rust-version = "1.89"
-version = "0.2.0"
+version = "0.2.1"
 
 [features]
 default = ["nist", "iso", "serde", "keygen", "encapsulate", "decapsulate", "kem"]

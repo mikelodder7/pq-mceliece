@@ -125,7 +125,9 @@
 //! ## Conformance
 //!
 //! Every NIST parameter set is checked bit for bit against the published `kat_kem.rsp` known
-//! answer tests. See `CONFORMANCE.md` for what is verified and how.
+//! answer tests. See
+//! [`CONFORMANCE.md`](https://github.com/mikelodder7/pq-mceliece/blob/main/CONFORMANCE.md)
+//! for what is verified and how.
 //!
 //! ## Features
 //!

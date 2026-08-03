@@ -26,3 +26,4 @@ Cargo.lock
 # Added by cargo
 
 /target
+/ISA.md

@@ -78,7 +78,7 @@ let (ct, sent) = ek.encapsulate_with_rng(&mut rng);
 assert_eq!(dk.decapsulate(&ct), sent);
 ```
 
-Runnable examples live in [`examples/`](examples/): `round_trip` covers every enabled
+Runnable examples live in [`examples/`](https://github.com/mikelodder7/pq-mceliece/tree/main/examples): `round_trip` covers every enabled
 parameter set, `recommended` is the shortest sound configuration, and `kem_traits` shows
 KEM-generic code and large-key export:
 
@@ -237,20 +237,20 @@ groups measure the two paths.
 ## Conformance
 
 Every NIST parameter set is verified bit for bit against the published `kat_kem.rsp` known
-answer tests. See [CONFORMANCE.md](CONFORMANCE.md) for the full picture, including what is
+answer tests. See [CONFORMANCE.md](https://github.com/mikelodder7/pq-mceliece/blob/main/CONFORMANCE.md) for the full picture, including what is
 verified for the ISO-only `pc` sets and the constant-time properties this crate does and does
 not claim.
 
 ## Security
 
-This crate has not been independently audited. See [SECURITY.md](SECURITY.md) for how to report a problem.
+This crate has not been independently audited. See [SECURITY.md](https://github.com/mikelodder7/pq-mceliece/blob/main/SECURITY.md) for how to report a problem.
 
 ## License
 
 Licensed under either of
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](https://github.com/mikelodder7/pq-mceliece/blob/main/LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](https://github.com/mikelodder7/pq-mceliece/blob/main/LICENSE-MIT))
 
 at your option.
 
