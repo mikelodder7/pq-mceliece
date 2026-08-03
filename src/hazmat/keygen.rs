@@ -169,6 +169,61 @@ fn move_columns<P: Params>(mat: &mut BitMatrix, pi: &mut [i16], pivots: &mut u64
     true
 }
 
+/// Build the leading `mt x mt` block of the parity-check matrix and eliminate it, reporting
+/// whether it is invertible -- which is exactly whether the full-width sweep would succeed.
+///
+/// The block build mirrors the full build below restricted to the first `mt` support
+/// positions, on a copy of the inverse evaluations so the caller's remain untouched. `mt` is
+/// not a multiple of eight for every parameter set, so the copy pads to a byte boundary with
+/// zeros; the padding columns sit past every pivot and influence nothing.
+fn square_block_is_invertible<P: Params>(inv: &[u16], support: &[u16]) -> bool {
+    const PANEL: usize = 32;
+
+    let padded = P::PK_NROWS.div_ceil(8) * 8;
+    let mut block_inv = Zeroizing::new(vec![0u16; padded]);
+    block_inv[..P::PK_NROWS].copy_from_slice(&inv[..P::PK_NROWS]);
+
+    let mut block = BitMatrix::zeros(P::PK_NROWS, P::PK_NROWS);
+    for i in 0..P::T {
+        for j in (0..padded).step_by(8) {
+            for k in 0..P::M {
+                let mut b = 0u8;
+                for offset in (0..8).rev() {
+                    b = (b << 1) | (((block_inv[j + offset] >> k) & 1) as u8);
+                }
+                block.set_byte(i * P::M + k, j / 8, b);
+            }
+        }
+        for (slot, &a) in block_inv.iter_mut().zip(support.iter()) {
+            *slot = P::Field::mul(*slot, a);
+        }
+    }
+
+    // The same forward sweep `mat_gen` runs, on the same schedule, minus the trailing block.
+    let mut panelled = 0;
+    {
+        let mut shadow = Zeroizing::new(vec![0u64; block.rows()]);
+        let mut scratch =
+            crate::hazmat::matrix::PanelScratch::new(block.rows(), block.stride(), PANEL);
+        while panelled + PANEL <= P::PK_NROWS {
+            if !block.eliminate_panel::<PANEL>(panelled, &mut shadow, &mut scratch) {
+                return false;
+            }
+            panelled += PANEL;
+        }
+    }
+    for row in panelled..P::PK_NROWS {
+        let first_word = row / 64;
+        block.accumulate_pivot(row, row, first_word);
+        if block.bit(row, row) == 0 {
+            return false;
+        }
+        block.clear_below(row, row, first_word);
+    }
+
+    true
+}
+
 /// `MatGen`: build the parity-check matrix for `(g, alpha)` and reduce it to systematic form.
 ///
 /// On success `pk` holds the `mt x k` matrix `T`, `pi` holds the (possibly column-swapped)
@@ -228,6 +283,19 @@ fn mat_gen<P: Params>(
     let mut inv = Zeroizing::new(vec![0u16; P::N]);
     for (slot, &packed) in inv.iter_mut().zip(buf.iter()) {
         *slot = ((packed >> 16) as u16) & P::Field::MASK;
+    }
+
+    // For the non-`f` sets, forward elimination succeeds with probability around 0.29, and a
+    // failure is only discovered near the last pivot columns -- after the whole `n`-wide
+    // matrix has been built and swept, ~85% of which updates the `k`-wide block that the
+    // failed attempt then throws away. Whether column `j` can supply a pivot depends only on
+    // column `j` as transformed by the pivots before it, all of which lie in the first `mt`
+    // columns, so eliminating the square `mt x mt` block alone is an exact predictor of the
+    // full sweep's outcome. Screen on that block first and pay the full-width build only for
+    // seeds that will succeed. The `f` sets skip this: they succeed almost always, and their
+    // column-moving detour straddles the block boundary.
+    if !P::SEMI_SYSTEMATIC && !square_block_is_invertible::<P>(&inv, &support) {
+        return false;
     }
 
     let mut mat = BitMatrix::zeros(P::PK_NROWS, P::N);
