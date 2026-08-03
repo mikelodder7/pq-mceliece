@@ -1,0 +1,32 @@
+[package]
+name = "pq-mceliece-comparison"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+default = ["mceliece6960119f"]
+mceliece348864 = ["pq-mceliece/mceliece348864", "classic-mceliece-rust/mceliece348864"]
+mceliece348864f = ["pq-mceliece/mceliece348864f", "classic-mceliece-rust/mceliece348864f"]
+mceliece460896 = ["pq-mceliece/mceliece460896", "classic-mceliece-rust/mceliece460896"]
+mceliece460896f = ["pq-mceliece/mceliece460896f", "classic-mceliece-rust/mceliece460896f"]
+mceliece6688128 = ["pq-mceliece/mceliece6688128", "classic-mceliece-rust/mceliece6688128"]
+mceliece6688128f = ["pq-mceliece/mceliece6688128f", "classic-mceliece-rust/mceliece6688128f"]
+mceliece6960119 = ["pq-mceliece/mceliece6960119", "classic-mceliece-rust/mceliece6960119"]
+mceliece6960119f = ["pq-mceliece/mceliece6960119f", "classic-mceliece-rust/mceliece6960119f"]
+mceliece8192128 = ["pq-mceliece/mceliece8192128", "classic-mceliece-rust/mceliece8192128"]
+mceliece8192128f = ["pq-mceliece/mceliece8192128f", "classic-mceliece-rust/mceliece8192128f"]
+
+[dependencies]
+classic-mceliece-rust = { version = "=3.1.0", default-features = false, features = ["alloc", "zeroize"] }
+criterion = "=0.8.1"
+pq-mceliece = { path = "../..", default-features = false, features = ["keygen", "encapsulate", "decapsulate"] }
+pqcrypto-classicmceliece = { version = "=0.2.1", default-features = true }
+rand-08 = { package = "rand", version = "=0.8.5", default-features = false }
+rand-chacha-08 = { package = "rand_chacha", version = "=0.3.1" }
+rand_chacha = "=0.10.0"
+rand_core = "=0.10.0"
+
+[[bench]]
+name = "implementations"
+harness = false
