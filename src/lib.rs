@@ -855,16 +855,18 @@ impl DecapsulationKey {
     /// subsequent [`PreparedDecapsulationKey::decapsulate`], at the cost of holding the derived
     /// material alongside the key. Decapsulating a single message is not worth preparing for.
     pub fn prepare(&self) -> PreparedDecapsulationKey {
-        let (scale, valid) = with_params!(&self.algorithm, P, {
+        let (scale, valid, conds) = with_params!(&self.algorithm, P, {
             let mut scale = vec![0; hazmat::decap::scale_words::<P>()];
             let mut valid = vec![0u8; hazmat::decap::valid_bytes::<P>()];
-            hazmat::decap::prepare::<P>(&self.value, &mut scale, &mut valid);
-            (scale, valid)
+            let mut conds = vec![0u64; hazmat::decap::cond_words::<P>()];
+            hazmat::decap::prepare::<P>(&self.value, &mut scale, &mut valid, &mut conds);
+            (scale, valid, conds)
         });
         PreparedDecapsulationKey {
             key: self.clone(),
             scale,
             valid,
+            conds,
         }
     }
 }
@@ -879,6 +881,7 @@ pub struct PreparedDecapsulationKey {
     key: DecapsulationKey,
     scale: Vec<hazmat::decap::PreparedWord>,
     valid: Vec<u8>,
+    conds: Vec<u64>,
 }
 
 #[cfg(feature = "decapsulate")]
@@ -913,6 +916,7 @@ impl PreparedDecapsulationKey {
                 &self.key.value,
                 &self.scale,
                 &self.valid,
+                &self.conds,
             ) {
                 return Err(Error::CiphertextPadding);
             }
@@ -930,6 +934,7 @@ impl Drop for PreparedDecapsulationKey {
         use zeroize::Zeroize;
         self.scale.zeroize();
         self.valid.zeroize();
+        self.conds.zeroize();
     }
 }
 

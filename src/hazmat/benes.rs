@@ -112,8 +112,74 @@ impl CondReader {
     }
 }
 
+/// The number of prepared 64-bit control words: one 64-word slot for each stage the network
+/// applies in transposed (bit-matrix) order. The direct-stride middle stages read the packed
+/// stream as plain word loads, so preparing them would buy nothing.
+pub(crate) const fn prepared_cond_words<P: Params>() -> usize {
+    2 * (P::M - 6) * 64
+}
+
+/// Pre-transpose the control words of the stages the network applies in bit-matrix order.
+///
+/// Applying the network spends most of its transposes re-deriving exactly this from the same
+/// key bytes, so a holder that applies it repeatedly -- decoding does, twice per message --
+/// can derive it once. The output is as sensitive as the control bits themselves.
+pub(crate) fn prepare_conds<P: Params>(conds: &mut [u64], bits: &[u8]) {
+    debug_assert_eq!(conds.len(), prepared_cond_words::<P>());
+    debug_assert_eq!(bits.len(), P::COND_BYTES);
+
+    match P::M {
+        12 => prepare_conds_12(conds, bits),
+        _ => prepare_conds_13(conds, bits),
+    }
+}
+
+/// Map an absolute transposed-stage number to its slot ordinal.
+///
+/// The transposed stages are the first and last `m - 6` of the `2m - 1` total; between them
+/// sit the eleven direct stages -- strides 64 up to 2048 and back -- both networks share, so
+/// the trailing block's ordinals shift down by eleven. The mapping is direction-independent,
+/// which is what lets one prepared array serve the network and its inverse.
+#[inline]
+fn transposed_slot(stage: usize, m: usize) -> usize {
+    let outer = m - 6;
+    if stage < outer { stage } else { stage - 11 }
+}
+
+/// The `m = 12` transposed stages, `0..=5` and `17..=22`, stored from their 32-bit groups.
+fn prepare_conds_12(conds: &mut [u64], bits: &[u8]) {
+    const STAGE: usize = 256;
+
+    let mut block = [0u64; 64];
+    for s in (0..6).chain(17..23) {
+        let at = s * STAGE;
+        for (i, word) in block.iter_mut().enumerate() {
+            *word = load_u32(bits, at + i * 4);
+        }
+        transpose_64x64(&mut block);
+        let slot = transposed_slot(s, 12);
+        conds[slot * 64..slot * 64 + 64].copy_from_slice(&block);
+    }
+}
+
+/// The `m = 13` transposed stages, `0..=6` and `18..=24`.
+fn prepare_conds_13(conds: &mut [u64], bits: &[u8]) {
+    const STAGE: usize = 512;
+
+    let mut block = [0u64; 64];
+    for s in (0..7).chain(18..25) {
+        let at = s * STAGE;
+        for (i, word) in block.iter_mut().enumerate() {
+            *word = load_u64(bits, at + i * 8);
+        }
+        transpose_64x64(&mut block);
+        let slot = transposed_slot(s, 13);
+        conds[slot * 64..slot * 64 + 64].copy_from_slice(&block);
+    }
+}
+
 /// Apply the `m = 12` network to 4096 bits held as 512 bytes.
-fn apply_benes_12(r: &mut [u8], bits: &[u8], reverse: bool) {
+fn apply_benes_12(r: &mut [u8], bits: &[u8], conds: &[u64], reverse: bool) {
     const STAGE: usize = 256;
     const STAGES: usize = 2 * 12 - 1;
 
@@ -125,16 +191,12 @@ fn apply_benes_12(r: &mut [u8], bits: &[u8], reverse: bool) {
         *word = load_u64(r, i * 8);
     }
 
-    // Stages 0..=5: stride below 64, so work on the transposed matrix. The control bits are
-    // stored one 32-bit group per row and must be transposed the same way.
+    // Stages 0..=5: stride below 64, so work on the transposed matrix against the
+    // pre-transposed control words.
     transpose_64x64(&mut bs);
     for lgs in 0..6 {
-        let at = reader.take();
-        for (i, word) in cond.iter_mut().enumerate() {
-            *word = load_u32(bits, at + i * 4);
-        }
-        transpose_64x64(&mut cond);
-        layer(&mut bs, &cond, lgs);
+        let slot = transposed_slot(reader.take() / STAGE, 12);
+        layer(&mut bs, &conds[slot * 64..slot * 64 + 64], lgs);
     }
     transpose_64x64(&mut bs);
 
@@ -150,12 +212,8 @@ fn apply_benes_12(r: &mut [u8], bits: &[u8], reverse: bool) {
     // Stages 17..=22: mirror of the first block.
     transpose_64x64(&mut bs);
     for lgs in (0..6).rev() {
-        let at = reader.take();
-        for (i, word) in cond.iter_mut().enumerate() {
-            *word = load_u32(bits, at + i * 4);
-        }
-        transpose_64x64(&mut cond);
-        layer(&mut bs, &cond, lgs);
+        let slot = transposed_slot(reader.take() / STAGE, 12);
+        layer(&mut bs, &conds[slot * 64..slot * 64 + 64], lgs);
     }
     transpose_64x64(&mut bs);
 
@@ -165,7 +223,7 @@ fn apply_benes_12(r: &mut [u8], bits: &[u8], reverse: bool) {
 }
 
 /// Apply the `m = 13` network to 8192 bits held as 1024 bytes.
-fn apply_benes_13(r: &mut [u8], bits: &[u8], reverse: bool) {
+fn apply_benes_13(r: &mut [u8], bits: &[u8], conds: &[u64], reverse: bool) {
     const STAGE: usize = 512;
     const STAGES: usize = 2 * 13 - 1;
 
@@ -176,7 +234,6 @@ fn apply_benes_13(r: &mut [u8], bits: &[u8], reverse: bool) {
     let mut hi = [0u64; 64];
     let mut flat = [0u64; 128];
     let mut cond_v = [0u64; 64];
-    let mut cond_h = [0u64; 64];
     let mut reader = CondReader::new(STAGE, STAGES, reverse);
 
     for i in 0..64 {
@@ -206,13 +263,8 @@ fn apply_benes_13(r: &mut [u8], bits: &[u8], reverse: bool) {
 
     to_flat!();
     for lgs in 0..=6 {
-        let at = reader.take();
-        for (i, word) in cond_v.iter_mut().enumerate() {
-            *word = load_u64(bits, at + i * 8);
-        }
-        cond_h.copy_from_slice(&cond_v);
-        transpose_64x64(&mut cond_h);
-        layer(&mut flat, &cond_h, lgs);
+        let slot = transposed_slot(reader.take() / STAGE, 13);
+        layer(&mut flat, &conds[slot * 64..slot * 64 + 64], lgs);
     }
     from_flat!();
 
@@ -226,13 +278,8 @@ fn apply_benes_13(r: &mut [u8], bits: &[u8], reverse: bool) {
 
     to_flat!();
     for lgs in (0..=6).rev() {
-        let at = reader.take();
-        for (i, word) in cond_v.iter_mut().enumerate() {
-            *word = load_u64(bits, at + i * 8);
-        }
-        cond_h.copy_from_slice(&cond_v);
-        transpose_64x64(&mut cond_h);
-        layer(&mut flat, &cond_h, lgs);
+        let slot = transposed_slot(reader.take() / STAGE, 13);
+        layer(&mut flat, &conds[slot * 64..slot * 64 + 64], lgs);
     }
     from_flat!();
 
@@ -242,18 +289,44 @@ fn apply_benes_13(r: &mut [u8], bits: &[u8], reverse: bool) {
     }
 }
 
+/// Apply the Beneš network using pre-transposed control words for the outer stages.
+///
+/// `r` must be `q / 8` bytes, `bits` must be [`Params::COND_BYTES`] bytes, and `conds` must
+/// come from [`prepare_conds`] over the same bits. Setting `reverse` applies the inverse
+/// permutation; the prepared representation is direction-independent because the stage layout
+/// is symmetric.
+pub(crate) fn apply_benes_prepared<P: Params>(
+    r: &mut [u8],
+    bits: &[u8],
+    conds: &[u64],
+    reverse: bool,
+) {
+    debug_assert_eq!(r.len(), P::Q / 8);
+    debug_assert_eq!(bits.len(), P::COND_BYTES);
+    debug_assert_eq!(conds.len(), prepared_cond_words::<P>());
+
+    match P::M {
+        12 => apply_benes_12(r, bits, conds, reverse),
+        _ => apply_benes_13(r, bits, conds, reverse),
+    }
+}
+
 /// Apply the Beneš network described by `bits` to the `q`-bit vector `r`.
 ///
 /// `r` must be `q / 8` bytes and `bits` must be [`Params::COND_BYTES`] bytes. Setting
-/// `reverse` applies the inverse permutation.
+/// `reverse` applies the inverse permutation. Derives the prepared control words on the spot;
+/// callers applying the network repeatedly should hold [`prepare_conds`] output instead.
+#[cfg(all(test, feature = "keygen"))]
 pub(crate) fn apply_benes<P: Params>(r: &mut [u8], bits: &[u8], reverse: bool) {
+    use zeroize::Zeroize;
+
     debug_assert_eq!(r.len(), P::Q / 8);
     debug_assert_eq!(bits.len(), P::COND_BYTES);
 
-    match P::M {
-        12 => apply_benes_12(r, bits, reverse),
-        _ => apply_benes_13(r, bits, reverse),
-    }
+    let mut conds = vec![0u64; prepared_cond_words::<P>()];
+    prepare_conds::<P>(&mut conds, bits);
+    apply_benes_prepared::<P>(r, bits, &conds, reverse);
+    conds.zeroize();
 }
 
 /// Recover the support `(alpha_0, ..., alpha_{n-1})` from stored control bits.

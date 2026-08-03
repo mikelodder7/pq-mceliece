@@ -4,7 +4,7 @@
 */
 //! Decapsulation: syndrome computation, Berlekamp-Massey decoding and implicit rejection.
 
-use super::benes::apply_benes;
+use super::benes::{apply_benes_prepared, prepare_conds, prepared_cond_words};
 use super::fft::{
     TransformWorkspace, eval_all_bitrev_sliced, eval_transpose_bitrev_sliced, sliced_words,
 };
@@ -517,24 +517,37 @@ pub(crate) fn valid_bytes<P: Params>() -> usize {
     P::Q / 8
 }
 
+/// The number of words [`prepare`] writes to its `conds` argument.
+pub(crate) fn cond_words<P: Params>() -> usize {
+    prepared_cond_words::<P>()
+}
+
 /// Precompute the parts of decoding that depend only on the private key.
 ///
 /// `scale` receives `1 / g(a)^2` for every field element, bit-sliced and in field-element
-/// order, and `valid` the mask of elements that carry a real code position. Neither reads the
-/// ciphertext, so a holder that decapsulates repeatedly under one key can do this once instead
-/// of once per message. It is roughly a third of the cost of a decapsulation.
-pub(crate) fn prepare<P: Params>(sk: &[u8], scale: &mut [Word], valid: &mut [u8]) {
+/// order, `valid` the mask of elements that carry a real code position, and `conds` the
+/// network's control words in prepared per-stage form. None of them reads the ciphertext, so a
+/// holder that decapsulates repeatedly under one key can do this once instead of once per
+/// message. It is roughly a third of the cost of a decapsulation.
+pub(crate) fn prepare<P: Params>(
+    sk: &[u8],
+    scale: &mut [Word],
+    valid: &mut [u8],
+    conds: &mut [u64],
+) {
     debug_assert_eq!(sk.len(), P::SECRET_KEY_LENGTH);
     debug_assert_eq!(scale.len(), scale_words::<P>());
     debug_assert_eq!(valid.len(), valid_bytes::<P>());
+    debug_assert_eq!(conds.len(), cond_words::<P>());
 
     let cond = control_bits::<P>(sk);
+    prepare_conds::<P>(conds, cond);
 
     // Which field elements carry a real code position. Elements beyond the code length must
     // not contribute to the re-encryption syndrome even if the locator happens to vanish there.
     valid.fill(0);
     valid[..P::N_BYTES].fill(0xFF);
-    apply_benes::<P>(valid, cond, true);
+    apply_benes_prepared::<P>(valid, cond, conds, true);
 
     let mut goppa = vec![0u16; P::T + 1];
     load_goppa::<P>(sk, &mut goppa);
@@ -569,11 +582,13 @@ pub(crate) fn decode_prepared<P: Params>(
     c0: &[u8],
     scale: &[Word],
     valid: &[u8],
+    conds: &[u64],
 ) -> u8 {
     debug_assert_eq!(e.len(), P::N_BYTES);
     debug_assert_eq!(c0.len(), P::SYND_BYTES);
     debug_assert_eq!(scale.len(), scale_words::<P>());
     debug_assert_eq!(valid.len(), valid_bytes::<P>());
+    debug_assert_eq!(conds.len(), cond_words::<P>());
 
     let cond = control_bits::<P>(sk);
     let plane = P::Q / 8;
@@ -581,7 +596,7 @@ pub(crate) fn decode_prepared<P: Params>(
     // The received word: `C0` extended with zeros, then moved into field-element order.
     let mut received = vec![0u8; plane];
     received[..P::SYND_BYTES].copy_from_slice(c0);
-    apply_benes::<P>(&mut received, cond, true);
+    apply_benes_prepared::<P>(&mut received, cond, conds, true);
 
     // The weighting depends only on the key, so both syndromes below share it.
     let tables = Tables::<<P as Params>::Field>::new();
@@ -646,7 +661,7 @@ pub(crate) fn decode_prepared<P: Params>(
     }
 
     // Back to code-position order.
-    apply_benes::<P>(&mut error, cond, false);
+    apply_benes_prepared::<P>(&mut error, cond, conds, false);
     e.copy_from_slice(&error[..P::N_BYTES]);
 
     use zeroize::Zeroize;
@@ -672,13 +687,15 @@ pub(crate) fn decode_prepared<P: Params>(
 pub(crate) fn decode<P: Params>(e: &mut [u8], sk: &[u8], c0: &[u8]) -> u8 {
     let mut scale = vec![0; scale_words::<P>()];
     let mut valid = vec![0u8; valid_bytes::<P>()];
-    prepare::<P>(sk, &mut scale, &mut valid);
+    let mut conds = vec![0u64; cond_words::<P>()];
+    prepare::<P>(sk, &mut scale, &mut valid, &mut conds);
 
-    let keep = decode_prepared::<P>(e, sk, c0, &scale, &valid);
+    let keep = decode_prepared::<P>(e, sk, c0, &scale, &valid, &conds);
 
     use zeroize::Zeroize;
     scale.zeroize();
     valid.zeroize();
+    conds.zeroize();
 
     keep
 }
@@ -707,6 +724,7 @@ pub(crate) fn decapsulate_prepared<P: Params>(
     sk: &[u8],
     scale: &[Word],
     valid: &[u8],
+    conds: &[u64],
 ) -> bool {
     debug_assert_eq!(session_key.len(), P::SHARED_SECRET_LENGTH);
     debug_assert_eq!(ciphertext.len(), P::CIPHERTEXT_LENGTH);
@@ -715,8 +733,14 @@ pub(crate) fn decapsulate_prepared<P: Params>(
     let padding_ok = ciphertext_padding_is_zero::<P>(ciphertext);
 
     let mut decoded = vec![0u8; P::N_BYTES];
-    let mut keep =
-        decode_prepared::<P>(&mut decoded, sk, &ciphertext[..P::SYND_BYTES], scale, valid);
+    let mut keep = decode_prepared::<P>(
+        &mut decoded,
+        sk,
+        &ciphertext[..P::SYND_BYTES],
+        scale,
+        valid,
+        conds,
+    );
 
     // Implicit rejection: replace `e` with `s` when decoding failed.
     let rejection = &sk[P::S_OFFSET..P::S_OFFSET + P::N_BYTES];
@@ -765,13 +789,15 @@ pub(crate) fn decapsulate_prepared<P: Params>(
 pub(crate) fn decapsulate<P: Params>(session_key: &mut [u8], ciphertext: &[u8], sk: &[u8]) -> bool {
     let mut scale = vec![0; scale_words::<P>()];
     let mut valid = vec![0u8; valid_bytes::<P>()];
-    prepare::<P>(sk, &mut scale, &mut valid);
+    let mut conds = vec![0u64; cond_words::<P>()];
+    prepare::<P>(sk, &mut scale, &mut valid, &mut conds);
 
-    let ok = decapsulate_prepared::<P>(session_key, ciphertext, sk, &scale, &valid);
+    let ok = decapsulate_prepared::<P>(session_key, ciphertext, sk, &scale, &valid, &conds);
 
     use zeroize::Zeroize;
     scale.zeroize();
     valid.zeroize();
+    conds.zeroize();
 
     ok
 }
