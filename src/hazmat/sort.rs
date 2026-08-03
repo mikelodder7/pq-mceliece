@@ -237,7 +237,25 @@ pub(crate) fn sort_packed_i32_power_of_two(x: &mut [i32]) {
         let mut base = 0;
         while base < n {
             let (left, right) = x[base..base + 2 * p].split_at_mut(p);
-            for (a, b) in left.iter_mut().zip(right.iter_mut()) {
+            // The two halves are contiguous and disjoint, which is exactly the comparator's
+            // shape, so the vector form applies directly. `p` is a power of two, so the
+            // vector loop is exact for `p >= 4` and the scalar loop below covers `p < 4`
+            // whole; LLVM does not recognize `minmax_packed_i32`'s arithmetic mask as a
+            // min/max, so without this the stage compiles to three times the operations.
+            #[cfg(target_arch = "aarch64")]
+            let mut k = 0;
+            #[cfg(not(target_arch = "aarch64"))]
+            let k = 0;
+            #[cfg(target_arch = "aarch64")]
+            while k + CHAIN_WIDTH <= p {
+                // SAFETY: `left` and `right` are disjoint `p`-element slices and
+                // `k + CHAIN_WIDTH <= p`, so both four-element regions are in bounds.
+                unsafe {
+                    minmax_packed_i32x4(left.as_mut_ptr().add(k), right.as_mut_ptr().add(k));
+                }
+                k += CHAIN_WIDTH;
+            }
+            for (a, b) in left[k..].iter_mut().zip(right[k..].iter_mut()) {
                 let (lo, hi) = minmax_packed_i32(*a, *b);
                 *a = lo;
                 *b = hi;
@@ -264,7 +282,13 @@ pub(crate) fn sort_packed_i32_power_of_two(x: &mut [i32]) {
 
                     let mut r = q;
                     while r > p {
-                        let window = &mut x[i + r..i + r + CHAIN_WIDTH];
+                        // SAFETY: `n`, `q`, `p` are powers of two with `2p <= q`, so
+                        // `n - q` is a multiple of `2p` and the largest run start with bit
+                        // `p` clear below `limit = n - q` is `n - q - 2p`. With
+                        // `offset <= p - CHAIN_WIDTH` and `r <= q` the window ends at
+                        // `i + r + CHAIN_WIDTH <= n - p`. The compiler cannot see this, and
+                        // the range check it otherwise emits costs a third of the loop.
+                        let window = unsafe { x.get_unchecked_mut(i + r..i + r + CHAIN_WIDTH) };
                         batch_minmax_packed_i32!(&mut carry, window);
                         r >>= 1;
                     }
