@@ -5,12 +5,14 @@
 //! Runtime CPU feature detection.
 //!
 //! The crate ships one scalar implementation of every kernel and, on some targets, one or more
-//! vector implementations of the same kernel. Which one runs is a runtime decision, so a stock
-//! `cargo build --release` reaches the fast path without the caller having to set `RUSTFLAGS`.
+//! vector implementations of the same kernel. On x86 which one runs is a runtime decision, so
+//! a stock `cargo build --release` reaches the fast path without the caller having to set
+//! `RUSTFLAGS`. On AArch64 the kernels use only baseline `neon`, so they are selected at
+//! compile time and no detection exists at all.
 //!
-//! Detection happens once and is cached in an atomic. The cached value is a *level* rather
-//! than a set of flags: kernels are written for a whole instruction-set tier, and a tier is
-//! only reported once every feature that tier's kernels use is present.
+//! On x86, detection happens once and is cached in an atomic. The cached value is a *level*
+//! rather than a set of flags: kernels are written for a whole instruction-set tier, and a
+//! tier is only reported once every feature that tier's kernels use is present.
 //!
 //! # Constant time
 //!
@@ -28,6 +30,7 @@ pub(crate) mod matrix_x86;
 /// The instruction-set tier the current host supports.
 ///
 /// Ordered by capability, so a kernel can test `level() >= Level::Avx2`.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Level {
     /// No vector kernels; the portable path runs.
@@ -108,9 +111,17 @@ mod detect {
 ))]
 pub(crate) mod vec_x86;
 
+/// The AArch64 form of the bit-sliced field multiply. Needs no detection: `neon` is baseline.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(feature = "keygen", feature = "decapsulate")
+))]
+pub(crate) mod vec_neon;
+
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 pub(crate) use detect::level;
 
-#[cfg(test)]
+#[cfg(all(test, any(target_arch = "x86_64", target_arch = "x86")))]
 mod tests {
     use super::*;
 

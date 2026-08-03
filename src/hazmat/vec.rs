@@ -37,8 +37,11 @@ pub(crate) const MAX_BITS: usize = 13;
 ///
 /// The width is the whole point: a hardware carry-less multiply already runs at about
 /// 2.8 ns per element, and 64-bit bit-slicing only reaches 1.7, which does not pay for the
-/// representation. At 128 bits it reaches 0.58. LLVM lowers `u128` bitwise operations to the
-/// target's vector registers, so this stays portable rather than needing intrinsics.
+/// representation. At 128 bits it reaches 0.58. Reaching that requires the planes to actually
+/// live in vector registers, which rustc does not arrange for an integer `u128` on either
+/// major target — see `simd::vec_x86` and `simd::vec_neon`, which name the register type
+/// directly. The portable `u128` form remains the checked reference and the path every
+/// remaining target runs.
 pub(crate) type Word = u128;
 
 /// The number of field elements one bit-sliced group holds.
@@ -64,9 +67,13 @@ pub(crate) struct Tables<F: Field> {
 }
 
 // Every invocation below is cfg-gated, so the definition must carry the union of those
-// gates: an x86-64 keygen-only build has no surviving invocation, and an unused macro is an
-// error under `-D warnings`.
-#[cfg(any(not(target_arch = "x86_64"), test, feature = "decapsulate"))]
+// gates: an x86-64 or AArch64 keygen-only build has no surviving invocation, and an unused
+// macro is an error under `-D warnings`.
+#[cfg(any(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    test,
+    feature = "decapsulate"
+))]
 macro_rules! karatsuba_product {
     ($name:ident, $word:ty, $slice:ty, $split:expr, $upper:expr) => {
         #[inline(always)]
@@ -113,9 +120,9 @@ macro_rules! karatsuba_product {
     };
 }
 
-#[cfg(any(not(target_arch = "x86_64"), test))]
+#[cfg(any(not(any(target_arch = "x86_64", target_arch = "aarch64")), test))]
 karatsuba_product!(product12, Word, Slice, 6, 6);
-#[cfg(any(not(target_arch = "x86_64"), test))]
+#[cfg(any(not(any(target_arch = "x86_64", target_arch = "aarch64")), test))]
 karatsuba_product!(product13, Word, Slice, 7, 6);
 #[cfg(feature = "decapsulate")]
 karatsuba_product!(product12_64, u64, Slice64, 6, 6);
@@ -126,9 +133,9 @@ karatsuba_product!(product13_64, u64, Slice64, 7, 6);
 ///
 /// The schoolbook convolution gives a product of degree up to `2m - 2`; the top half folds back
 /// through the standardized sparse field polynomial. Every operation is a word-wide `AND` or
-/// `XOR`, so all [`LANES`] lanes advance together. This is the reference the x86 kernel is
-/// checked against, and the implementation every non-x86 target runs.
-#[cfg(any(not(target_arch = "x86_64"), test))]
+/// `XOR`, so all [`LANES`] lanes advance together. This is the reference the x86 and AArch64
+/// kernels are checked against, and the implementation every remaining target runs.
+#[cfg(any(not(any(target_arch = "x86_64", target_arch = "aarch64")), test))]
 pub(crate) fn portable_mul<const BITS: usize>(out: &mut Slice, a: &Slice, b: &Slice) {
     let mut product = if BITS == 12 {
         product12(a, b)
@@ -163,7 +170,7 @@ pub(crate) fn portable_mul<const BITS: usize>(out: &mut Slice, a: &Slice, b: &Sl
 ///
 /// Squaring is `F_2`-linear in characteristic two, so it is just a fixed exclusive-or pattern
 /// across the words with no multiplication at all.
-#[cfg(any(not(target_arch = "x86_64"), test))]
+#[cfg(any(not(any(target_arch = "x86_64", target_arch = "aarch64")), test))]
 pub(crate) fn portable_sq<const BITS: usize>(out: &mut Slice, a: &Slice) {
     let mut result = [0; MAX_BITS];
     if BITS == 12 {
@@ -245,7 +252,20 @@ impl<F: Field> Tables<F> {
                 vec_x86::mul::<13>(out, a, b);
             }
         }
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        {
+            // On AArch64 the planes likewise go in vector registers explicitly; see
+            // `simd::vec_neon` for why `u128` does not get there on its own. `neon` is
+            // baseline, so there is no detection and no fused form to select.
+            use crate::hazmat::simd::vec_neon;
+            if F::BITS == 12 {
+                vec_neon::mul::<12>(out, a, b);
+            } else {
+                debug_assert_eq!(F::BITS, 13);
+                vec_neon::mul::<13>(out, a, b);
+            }
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             if F::BITS == 12 {
                 portable_mul::<12>(out, a, b);
@@ -304,7 +324,15 @@ impl<F: Field> Tables<F> {
             crate::hazmat::simd::vec_x86::sq::<13>(out, a);
         }
 
-        #[cfg(not(target_arch = "x86_64"))]
+        #[cfg(target_arch = "aarch64")]
+        if F::BITS == 12 {
+            crate::hazmat::simd::vec_neon::sq::<12>(out, a);
+        } else {
+            debug_assert_eq!(F::BITS, 13);
+            crate::hazmat::simd::vec_neon::sq::<13>(out, a);
+        }
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         if F::BITS == 12 {
             portable_sq::<12>(out, a);
         } else {

@@ -6,17 +6,14 @@
 //!
 //! # Why this exists
 //!
-//! `vec.rs` picks `u128` as the bit-plane word and justifies it with "LLVM lowers `u128` bitwise
-//! operations to the target's vector registers, so this stays portable rather than needing
-//! intrinsics". That holds on AArch64, where a `u128` is a NEON `v` register and one exclusive-or
-//! is one instruction out of thirty-two available registers. It does not hold on x86-64, where
-//! `u128` is an *integer* type: values arrive in pairs of general-purpose registers and have to be
-//! assembled into `xmm` before a vector operation and taken apart afterwards. Compiling the
-//! thirteen-plane exclusive-or on its own emits fifteen `movaps`, six `movq`, four `movsd` and two
-//! `movlhps` around only nine actual exclusive-ors — more data movement than arithmetic.
-//!
-//! That asymmetry is the main reason this crate runs closer to its potential on Apple silicon,
-//! which is also the machine its bit-slicing was tuned on, than on x86.
+//! `vec.rs` picks `u128` as the bit-plane word for its width, but `u128` is an *integer* type:
+//! on x86-64 values arrive in pairs of general-purpose registers and have to be assembled into
+//! `xmm` before a vector operation and taken apart afterwards. Compiling the thirteen-plane
+//! exclusive-or on its own emits fifteen `movaps`, six `movq`, four `movsd` and two `movlhps`
+//! around only nine actual exclusive-ors — more data movement than arithmetic. AArch64 has the
+//! same problem in a different costume — rustc keeps `u128` in general-register pairs there
+//! too, and the convolution's live planes overflow the integer file into stack spills — which
+//! is why `vec_neon` exists as this module's sibling.
 //!
 //! Naming the register type directly removes the round trip. `sse2` is part of the x86-64
 //! baseline, so unlike every other kernel here this one needs no runtime detection and no
