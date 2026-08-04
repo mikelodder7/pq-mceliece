@@ -291,6 +291,7 @@ unsafe fn xor_sources_avx512<const N: usize>(
 ) {
     use core::arch::x86_64::{
         _mm512_loadu_epi64, _mm512_set1_epi64, _mm512_storeu_epi64, _mm512_ternarylogic_epi64,
+        _mm512_xor_si512,
     };
 
     // SAFETY: the caller guarantees one destination row and `N` disjoint source rows, each of
@@ -304,13 +305,25 @@ unsafe fn xor_sources_avx512<const N: usize>(
         let mut i = 0;
         while i + AVX512_LANES <= len {
             // The destination chunk is loaded and stored once for all `N` sources, so the
-            // destination streams past the cache once instead of `N` times.
-            let mut acc = _mm512_loadu_epi64(destination.add(i) as *const i64);
-            for (row, &broadcast) in broadcasts.iter().enumerate() {
-                let s = _mm512_loadu_epi64(sources.add(row * stride + i) as *const i64);
-                acc = _mm512_ternarylogic_epi64::<0x78>(acc, s, broadcast);
+            // destination streams past the cache once instead of `N` times. The fold runs as
+            // two independent accumulator chains joined at the store: one chain would make
+            // every ternary-logic op wait on the previous one, and the sources arrive from
+            // cache faster than that.
+            let mut even = _mm512_loadu_epi64(destination.add(i) as *const i64);
+            let mut odd = _mm512_set1_epi64(0);
+            let (pairs, tail) = broadcasts.as_chunks::<2>();
+            for (pair_index, pair) in pairs.iter().enumerate() {
+                let row = 2 * pair_index;
+                let s0 = _mm512_loadu_epi64(sources.add(row * stride + i) as *const i64);
+                let s1 = _mm512_loadu_epi64(sources.add((row + 1) * stride + i) as *const i64);
+                even = _mm512_ternarylogic_epi64::<0x78>(even, s0, pair[0]);
+                odd = _mm512_ternarylogic_epi64::<0x78>(odd, s1, pair[1]);
             }
-            _mm512_storeu_epi64(destination.add(i) as *mut i64, acc);
+            if let Some(&last) = tail.first() {
+                let s = _mm512_loadu_epi64(sources.add((N - 1) * stride + i) as *const i64);
+                even = _mm512_ternarylogic_epi64::<0x78>(even, s, last);
+            }
+            _mm512_storeu_epi64(destination.add(i) as *mut i64, _mm512_xor_si512(even, odd));
             i += AVX512_LANES;
         }
         while i < len {
@@ -346,12 +359,26 @@ unsafe fn xor_sources_avx2<const N: usize>(
 
         let mut i = 0;
         while i + AVX2_LANES <= len {
-            let mut acc = _mm256_loadu_si256(destination.add(i) as *const __m256i);
-            for (row, &broadcast) in broadcasts.iter().enumerate() {
-                let s = _mm256_loadu_si256(sources.add(row * stride + i) as *const __m256i);
-                acc = _mm256_xor_si256(acc, _mm256_and_si256(s, broadcast));
+            // Two accumulator chains joined at the store, for the same reason as the 512-bit
+            // kernel above.
+            let mut even = _mm256_loadu_si256(destination.add(i) as *const __m256i);
+            let mut odd = _mm256_setzero_si256();
+            let (pairs, tail) = broadcasts.as_chunks::<2>();
+            for (pair_index, pair) in pairs.iter().enumerate() {
+                let row = 2 * pair_index;
+                let s0 = _mm256_loadu_si256(sources.add(row * stride + i) as *const __m256i);
+                let s1 = _mm256_loadu_si256(sources.add((row + 1) * stride + i) as *const __m256i);
+                even = _mm256_xor_si256(even, _mm256_and_si256(s0, pair[0]));
+                odd = _mm256_xor_si256(odd, _mm256_and_si256(s1, pair[1]));
             }
-            _mm256_storeu_si256(destination.add(i) as *mut __m256i, acc);
+            if let Some(&last) = tail.first() {
+                let s = _mm256_loadu_si256(sources.add((N - 1) * stride + i) as *const __m256i);
+                even = _mm256_xor_si256(even, _mm256_and_si256(s, last));
+            }
+            _mm256_storeu_si256(
+                destination.add(i) as *mut __m256i,
+                _mm256_xor_si256(even, odd),
+            );
             i += AVX2_LANES;
         }
         while i < len {
