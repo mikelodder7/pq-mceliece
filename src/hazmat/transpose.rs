@@ -8,29 +8,31 @@
 //! transpose is computed by six recursive block exchanges, each swapping the off-diagonal
 //! halves of blocks of decreasing size.
 
-/// Masks for the six exchange rounds: `(low_half, high_half)` for block size `2^d`.
-const MASKS: [(u64, u64); 6] = [
-    (0x5555_5555_5555_5555, 0xAAAA_AAAA_AAAA_AAAA),
-    (0x3333_3333_3333_3333, 0xCCCC_CCCC_CCCC_CCCC),
-    (0x0F0F_0F0F_0F0F_0F0F, 0xF0F0_F0F0_F0F0_F0F0),
-    (0x00FF_00FF_00FF_00FF, 0xFF00_FF00_FF00_FF00),
-    (0x0000_FFFF_0000_FFFF, 0xFFFF_0000_FFFF_0000),
-    (0x0000_0000_FFFF_FFFF, 0xFFFF_FFFF_0000_0000),
+/// Masks selecting the low half of each block for the six exchange rounds.
+const MASKS: [u64; 6] = [
+    0x5555_5555_5555_5555,
+    0x3333_3333_3333_3333,
+    0x0F0F_0F0F_0F0F_0F0F,
+    0x00FF_00FF_00FF_00FF,
+    0x0000_FFFF_0000_FFFF,
+    0x0000_0000_FFFF_FFFF,
 ];
 
 /// Transpose a 64x64 bit matrix in place.
 pub(crate) fn transpose_64x64(m: &mut [u64; 64]) {
     for d in (0..6).rev() {
         let s = 1usize << d;
-        let (lo_mask, hi_mask) = MASKS[d];
+        let lo_mask = MASKS[d];
 
         let mut i = 0;
         while i < 64 {
             for j in i..i + s {
-                let x = (m[j] & lo_mask) | ((m[j + s] & lo_mask) << s);
-                let y = ((m[j] & hi_mask) >> s) | (m[j + s] & hi_mask);
-                m[j] = x;
-                m[j + s] = y;
+                // The delta form of the block exchange: `t` is the difference between the
+                // two off-diagonal halves, applied to each. Six operations per pair where
+                // masking each half separately takes eight.
+                let t = ((m[j] >> s) ^ m[j + s]) & lo_mask;
+                m[j + s] ^= t;
+                m[j] ^= t << s;
             }
             i += s * 2;
         }
