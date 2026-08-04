@@ -99,21 +99,57 @@ fn xor_row_if(destination: &mut [u64], source: &[u64], condition: u64) {
     }
 }
 
-/// Whether this target has the blocked kernels that fold several rows in one streaming pass.
-///
-/// The blocked shape is a memory-traffic optimization rather than a width one: for the larger
-/// parameter sets the matrix does not fit in L2, so what matters is how many times it streams
-/// past the caches, and folding eight rows into one pass divides that by eight.
-macro_rules! cfg_blocked {
-    ($($item:item)*) => {
-        $(
-            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-            $item
-        )*
-    };
+// The blocked kernels fold several rows into one streaming pass. The blocked shape is a
+// memory-traffic optimization rather than a width one: for the larger parameter sets the
+// matrix does not fit in L2, so what matters is how many times it streams past the caches,
+// and folding eight or sixteen rows into one pass divides that by as much. Every target gets
+// the shape; which kernel implements it is per-architecture, with a plain-word form for the
+// rest.
+
+/// The portable form of the destination-blocked kernel: one masked pass of the source over
+/// each of `COUNT` cached destination rows.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn xor_rows_portable<const COUNT: usize>(
+    destinations: &mut [u64],
+    source: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: &[u64; COUNT],
+) {
+    for (row, &condition) in destinations
+        .chunks_exact_mut(stride)
+        .zip(conditions.iter())
+        .take(COUNT)
+    {
+        let mask = 0u64.wrapping_sub(condition);
+        for (target, &word) in row[first..].iter_mut().zip(source[first..].iter()) {
+            *target ^= word & mask;
+        }
+    }
 }
 
-cfg_blocked! {
+/// The portable form of the source-blocked kernel: `COUNT` masked source rows folded into one
+/// destination row that stays cached across the whole fold.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+fn xor_sources_portable<const COUNT: usize>(
+    destination: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: &[u64; COUNT],
+) {
+    for (row, &condition) in sources
+        .chunks_exact(stride)
+        .zip(conditions.iter())
+        .take(COUNT)
+    {
+        let mask = 0u64.wrapping_sub(condition);
+        for (target, &word) in destination[first..].iter_mut().zip(row[first..].iter()) {
+            *target ^= word & mask;
+        }
+    }
+}
+
 /// XOR one source row into eight destinations, each gated by its own condition.
 #[inline(always)]
 fn xor_eight_rows(
@@ -127,6 +163,8 @@ fn xor_eight_rows(
     xor_eight_rows_if_compact(destinations, source, stride, first, *conditions);
     #[cfg(target_arch = "x86_64")]
     super::simd::matrix_x86::xor_rows_if::<8>(destinations, source, stride, first, conditions);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    xor_rows_portable::<8>(destinations, source, stride, first, conditions);
 }
 
 /// XOR eight masked source rows into one destination.
@@ -142,6 +180,8 @@ fn xor_eight_sources(
     xor_eight_sources_if_compact(destination, sources, stride, first, *conditions);
     #[cfg(target_arch = "x86_64")]
     super::simd::matrix_x86::xor_sources_if::<8>(destination, sources, stride, first, conditions);
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    xor_sources_portable::<8>(destination, sources, stride, first, conditions);
 }
 
 /// XOR sixteen masked source rows into one destination.
@@ -157,7 +197,8 @@ fn xor_sixteen_sources(
     xor_sixteen_sources_if_compact(destination, sources, stride, first, *conditions);
     #[cfg(target_arch = "x86_64")]
     super::simd::matrix_x86::xor_sources_if::<16>(destination, sources, stride, first, conditions);
-}
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    xor_sources_portable::<16>(destination, sources, stride, first, conditions);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -707,41 +748,27 @@ fn accumulate_rows(
 ) {
     let mut target_bit = (target[pivot_word] >> pivot_shift) & 1;
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    {
-        let grouped = sources.len() / (8 * stride) * (8 * stride);
-        let (groups, remainder) = sources.split_at(grouped);
-        for group in groups.chunks_exact(8 * stride) {
-            let source_bits = [
-                (group[pivot_word] >> pivot_shift) & 1,
-                (group[stride + pivot_word] >> pivot_shift) & 1,
-                (group[2 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[3 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[4 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[5 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[6 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[7 * stride + pivot_word] >> pivot_shift) & 1,
-            ];
-            let mut conditions = [0u64; 8];
-            for i in 0..8 {
-                conditions[i] = target_bit ^ source_bits[i];
-                target_bit |= source_bits[i];
-            }
-            xor_eight_sources(target, group, stride, first, &conditions);
+    let grouped = sources.len() / (8 * stride) * (8 * stride);
+    let (groups, remainder) = sources.split_at(grouped);
+    for group in groups.chunks_exact(8 * stride) {
+        let source_bits = [
+            (group[pivot_word] >> pivot_shift) & 1,
+            (group[stride + pivot_word] >> pivot_shift) & 1,
+            (group[2 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[3 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[4 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[5 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[6 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[7 * stride + pivot_word] >> pivot_shift) & 1,
+        ];
+        let mut conditions = [0u64; 8];
+        for i in 0..8 {
+            conditions[i] = target_bit ^ source_bits[i];
+            target_bit |= source_bits[i];
         }
-        for source in remainder.chunks_exact(stride) {
-            let source_bit = (source[pivot_word] >> pivot_shift) & 1;
-            xor_row_if(
-                &mut target[first..],
-                &source[first..],
-                target_bit ^ source_bit,
-            );
-            target_bit |= source_bit;
-        }
+        xor_eight_sources(target, group, stride, first, &conditions);
     }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    for source in sources.chunks_exact(stride) {
+    for source in remainder.chunks_exact(stride) {
         let source_bit = (source[pivot_word] >> pivot_shift) & 1;
         xor_row_if(
             &mut target[first..],
@@ -761,31 +788,22 @@ fn clear_rows(
     pivot_shift: usize,
     first: usize,
 ) {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    {
-        let grouped = targets.len() / (8 * stride) * (8 * stride);
-        let (groups, remainder) = targets.split_at_mut(grouped);
-        for group in groups.chunks_exact_mut(8 * stride) {
-            let conditions = [
-                (group[pivot_word] >> pivot_shift) & 1,
-                (group[stride + pivot_word] >> pivot_shift) & 1,
-                (group[2 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[3 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[4 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[5 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[6 * stride + pivot_word] >> pivot_shift) & 1,
-                (group[7 * stride + pivot_word] >> pivot_shift) & 1,
-            ];
-            xor_eight_rows(group, source, stride, first, &conditions);
-        }
-        for target in remainder.chunks_exact_mut(stride) {
-            let condition = (target[pivot_word] >> pivot_shift) & 1;
-            xor_row_if(&mut target[first..], &source[first..], condition);
-        }
+    let grouped = targets.len() / (8 * stride) * (8 * stride);
+    let (groups, remainder) = targets.split_at_mut(grouped);
+    for group in groups.chunks_exact_mut(8 * stride) {
+        let conditions = [
+            (group[pivot_word] >> pivot_shift) & 1,
+            (group[stride + pivot_word] >> pivot_shift) & 1,
+            (group[2 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[3 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[4 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[5 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[6 * stride + pivot_word] >> pivot_shift) & 1,
+            (group[7 * stride + pivot_word] >> pivot_shift) & 1,
+        ];
+        xor_eight_rows(group, source, stride, first, &conditions);
     }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    for target in targets.chunks_exact_mut(stride) {
+    for target in remainder.chunks_exact_mut(stride) {
         let condition = (target[pivot_word] >> pivot_shift) & 1;
         xor_row_if(&mut target[first..], &source[first..], condition);
     }
@@ -994,7 +1012,6 @@ impl BitMatrix {
         let (before, block_and_after) = self.data.split_at_mut(block_start);
         let block = &block_and_after[..count * stride];
 
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         if count == 16 {
             for target in before.chunks_exact_mut(stride) {
                 let mut conditions = [0u64; 16];
@@ -1007,7 +1024,6 @@ impl BitMatrix {
             return;
         }
 
-        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         if count == 8 {
             for target in before.chunks_exact_mut(stride) {
                 let conditions = [
@@ -1025,8 +1041,8 @@ impl BitMatrix {
             return;
         }
 
-        // Portable path and the one short block possible when the row count is not a multiple
-        // of sixteen. The fixed source order is still data oblivious.
+        // The one short block possible when the row count is not a multiple of sixteen. The
+        // fixed source order is still data oblivious.
         for (offset, source) in block.chunks_exact(stride).enumerate().rev() {
             clear_rows(
                 before,
@@ -1360,31 +1376,23 @@ fn apply_to_panel<const COUNT: usize>(
 ) {
     debug_assert_eq!(destinations.len(), COUNT * stride);
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    {
-        let mut done = 0;
-        while done + 8 <= COUNT {
-            let mut group = [0u64; 8];
-            group.copy_from_slice(&conditions[done..done + 8]);
-            let rows = &mut destinations[done * stride..(done + 8) * stride];
-            xor_eight_rows(rows, source, stride, first, &group);
-            done += 8;
-        }
-        for (offset, target) in destinations[done * stride..]
-            .chunks_exact_mut(stride)
-            .enumerate()
-        {
-            xor_row_if(
-                &mut target[first..],
-                &source[first..],
-                conditions[done + offset],
-            );
-        }
+    let mut done = 0;
+    while done + 8 <= COUNT {
+        let mut group = [0u64; 8];
+        group.copy_from_slice(&conditions[done..done + 8]);
+        let rows = &mut destinations[done * stride..(done + 8) * stride];
+        xor_eight_rows(rows, source, stride, first, &group);
+        done += 8;
     }
-
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    for (offset, target) in destinations.chunks_exact_mut(stride).enumerate() {
-        xor_row_if(&mut target[first..], &source[first..], conditions[offset]);
+    for (offset, target) in destinations[done * stride..]
+        .chunks_exact_mut(stride)
+        .enumerate()
+    {
+        xor_row_if(
+            &mut target[first..],
+            &source[first..],
+            conditions[done + offset],
+        );
     }
 }
 
@@ -1401,12 +1409,10 @@ fn apply_panel<const COUNT: usize>(
     conditions: &[u64; 16],
     conditions_high: &[u64; 16],
 ) {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if COUNT == 16 {
         xor_sixteen_sources(target, block, stride, first, conditions);
         return;
     }
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     if COUNT == 32 {
         let (low, high) = block.split_at(16 * stride);
         let mut upper = [0u64; 16];
