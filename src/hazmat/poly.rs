@@ -66,33 +66,59 @@ pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool 
     debug_assert_eq!(out.len(), t);
     debug_assert_eq!(f.len(), t);
 
-    // `mat[c]` holds the coefficient vector of `beta^c`, so solving the system for the
-    // dependency among `1, beta, ..., beta^t` yields the minimal polynomial.
+    // `mat` holds the coefficient vectors of `1, beta, ..., beta^t`, stored so that one
+    // coefficient's values across all powers are contiguous: the elimination below sweeps
+    // across powers for a fixed coefficient, and the contiguous span is what lets those
+    // sweeps vectorize and stay in cache — the power-major layout made every elimination
+    // access a stride-`t` walk.
     let mut mat = Zeroizing::new(vec![0u16; (t + 1) * t]);
     let mut scratch = Zeroizing::new(vec![0u16; 2 * t]);
+    let at = |c: usize, j: usize| j * (t + 1) + c;
 
-    mat[0] = 1;
-    mat[t..2 * t].copy_from_slice(f);
+    // Powers are built row by row in a small scratch pair and scattered into the
+    // coefficient-major layout; the scatter is quadratic against the elimination's cubic.
+    let mut previous = Zeroizing::new(vec![0u16; t]);
+    let mut power = Zeroizing::new(vec![0u16; t]);
+    mat[at(0, 0)] = 1;
+    for (j, &coefficient) in f.iter().enumerate() {
+        mat[at(1, j)] = coefficient;
+    }
+    previous.copy_from_slice(f);
     for c in 2..=t {
-        let (lower, upper) = mat.split_at_mut(c * t);
-        let previous = &lower[(c - 1) * t..c * t];
-        mul_mod_f::<P>(&mut upper[..t], previous, f, &mut scratch);
+        mul_mod_f::<P>(&mut power, &previous, f, &mut scratch);
+        for (j, &coefficient) in power.iter().enumerate() {
+            mat[at(c, j)] = coefficient;
+        }
+        core::mem::swap(&mut previous, &mut power);
     }
 
-    // Gaussian elimination on the `t x (t+1)` system. `mat[c][j]` is coefficient `j` of
+    // Gaussian elimination on the `t x (t+1)` system. `mat[at(c, j)]` is coefficient `j` of
     // `beta^c`, so the elimination runs across `c` for each column `j`.
-    let at = |c: usize, j: usize| c * t + j;
+
+    // The sweeps pair two columns at a time; borrowing them as disjoint slices is what lets
+    // the compiler prove no aliasing and vectorize the field arithmetic across powers.
+    let width = t + 1;
+    fn column_pair(mat: &mut [u16], width: usize, j: usize, k: usize) -> (&mut [u16], &mut [u16]) {
+        debug_assert_ne!(j, k);
+        if j < k {
+            let (head, tail) = mat.split_at_mut(k * width);
+            (&mut head[j * width..(j + 1) * width], &mut tail[..width])
+        } else {
+            let (head, tail) = mat.split_at_mut(j * width);
+            (&mut tail[..width], &mut head[k * width..(k + 1) * width])
+        }
+    }
 
     for j in 0..t {
         // Constant-time pivot search: add every later column into column `j` while column `j`
         // is still zero.
         for k in j + 1..t {
-            let mask = is_zero_mask(mat[at(j, j)]);
+            let (pivot_column, other) = column_pair(&mut mat, width, j, k);
+            let mask = is_zero_mask(pivot_column[j]);
             let choice = Choice::from_u16_lsb(mask);
-            for c in j..=t {
-                let destination = at(c, j);
-                let sum = mat[destination] ^ mat[at(c, k)];
-                mat[destination].ct_assign(&sum, choice);
+            for (destination, &source) in pivot_column[j..].iter_mut().zip(other[j..].iter()) {
+                let sum = *destination ^ source;
+                destination.ct_assign(&sum, choice);
             }
         }
 
@@ -104,21 +130,24 @@ pub(crate) fn minimal_polynomial<P: Params>(out: &mut [u16], f: &[u16]) -> bool 
         }
 
         let inv = P::Field::inv(mat[at(j, j)]);
-        for c in j..=t {
-            mat[at(c, j)] = P::Field::mul(mat[at(c, j)], inv);
+        for slot in mat[at(j, j)..at(t, j) + 1].iter_mut() {
+            *slot = P::Field::mul(*slot, inv);
         }
 
         for k in 0..t {
             if k != j {
-                let factor = mat[at(j, k)];
-                for c in j..=t {
-                    mat[at(c, k)] ^= P::Field::mul(mat[at(c, j)], factor);
+                let (pivot_column, other) = column_pair(&mut mat, width, j, k);
+                let factor = other[j];
+                for (destination, &source) in other[j..].iter_mut().zip(pivot_column[j..].iter()) {
+                    *destination ^= P::Field::mul(source, factor);
                 }
             }
         }
     }
 
-    out.copy_from_slice(&mat[at(t, 0)..at(t, 0) + t]);
+    for (j, slot) in out.iter_mut().enumerate() {
+        *slot = mat[at(t, j)];
+    }
     true
 }
 
