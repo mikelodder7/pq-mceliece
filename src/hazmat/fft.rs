@@ -40,6 +40,7 @@ use super::vec::{LANE_BIT_MASKS, LANE_BITS, LANES, MAX_BITS, Slice, Tables, Word
 /// The split uses `tau^(n/4) = x^(n/2) + x^(n/4)`, which holds because squaring is additive in
 /// characteristic two. Dividing by it is therefore just a fold of the top half onto the middle,
 /// after which the top half already holds the high digits and the halves recurse independently.
+#[cfg(test)]
 fn taylor(g: &mut [u16]) {
     let n = g.len();
     if n <= 2 {
@@ -62,7 +63,7 @@ fn taylor(g: &mut [u16]) {
 /// Transposing a product of elementary row additions reverses their order and swaps each
 /// source with its destination, so the fold runs upwards and writes the other way round, and
 /// the recursion happens before it rather than after.
-#[cfg(any(feature = "decapsulate", test))]
+#[cfg(test)]
 fn taylor_transpose(g: &mut [u16]) {
     let n = g.len();
     if n <= 2 {
@@ -97,6 +98,14 @@ struct Levels {
     power_starts: [usize; MAX_BITS + 1],
     /// Powers of each level's public rescaling element.
     powers: Vec<u16>,
+    /// The transform length the power tables were built for.
+    plan_length: usize,
+    /// Start of each depth's bit-sliced power groups, for the plan length and its half.
+    sliced_starts: [[usize; MAX_BITS + 1]; 2],
+    /// The per-depth rescaling powers, tiled across the lanes of each coefficient group so the
+    /// coefficient pass rescales a whole group with one bit-sliced multiply. The powers are
+    /// public, so packing them here costs each decode nothing.
+    sliced_powers: Vec<Slice>,
     /// Start of each depth's precomputed bit-sliced subspace sums.
     omega_starts: [usize; MAX_BITS + 1],
     /// Bit-sliced subspace sums, shared by every transform in one decode.
@@ -149,6 +158,9 @@ fn levels_for<P: Params>(count: usize, basis: &[u16]) -> Levels {
         count,
         power_starts: [0; MAX_BITS + 1],
         powers: Vec::new(),
+        plan_length: 0,
+        sliced_starts: [[0; MAX_BITS + 1]; 2],
+        sliced_powers: Vec::new(),
         omega_starts: [0; MAX_BITS + 1],
         omegas: Vec::new(),
     }
@@ -165,7 +177,47 @@ fn levels_with_powers<P: Params>(count: usize, basis: &[u16], length: usize) -> 
         }
     }
     levels.power_starts[count] = levels.powers.len();
+
+    // Pre-pack the powers for the bit-sliced coefficient pass. The decoder runs transforms at
+    // two lengths -- the syndrome length and, for some parameter sets, its half for the
+    // locator and Goppa evaluations -- and the lane tiling depends on the block size, so both
+    // variants are packed. A coefficient at position `p` of a segment is rescaled by
+    // `powers[p % block]`, which is what the tiling reproduces lane by lane.
+    levels.plan_length = length;
+    for (variant, vlen) in [length, length / 2].into_iter().enumerate() {
+        for depth in 0..count {
+            levels.sliced_starts[variant][depth] = levels.sliced_powers.len();
+            let block = vlen >> depth;
+            if block < 2 {
+                continue;
+            }
+            let start = levels.power_starts[depth];
+            for g in 0..vlen.div_ceil(LANES) {
+                let mut slice: Slice = [0; MAX_BITS];
+                for lane in 0..LANES {
+                    let value = levels.powers[start + ((g * LANES + lane) % block)];
+                    for (i, plane) in slice.iter_mut().take(P::M).enumerate() {
+                        *plane |= Word::from((value >> i) & 1) << lane;
+                    }
+                }
+                levels.sliced_powers.push(slice);
+            }
+        }
+        levels.sliced_starts[variant][count] = levels.sliced_powers.len();
+    }
     levels
+}
+
+impl Levels {
+    /// Which pre-packed power variant serves a transform of `length`.
+    fn sliced_variant(&self, length: usize) -> usize {
+        if length == self.plan_length {
+            0
+        } else {
+            debug_assert_eq!(length * 2, self.plan_length);
+            1
+        }
+    }
 }
 
 /// Fill `prefix` so that walking `j` upwards accumulates the basis elements its bits select.
@@ -278,6 +330,7 @@ pub(crate) fn eval_all_bitrev<P: Params>(out: &mut [u16], f: &[u16]) {
 /// Rescale, rewrite in powers of tau, and split even from odd digits, once per level.
 ///
 /// After `levels` rounds each entry is the constant that one leaf of the recursion would see.
+#[cfg(test)]
 fn coefficient_pass<P: Params>(
     coefficients: &mut [u16],
     scratch: &mut [u16],
@@ -312,7 +365,7 @@ fn coefficient_pass<P: Params>(
 
 /// The transpose of [`coefficient_pass`]: the level order reverses, the even-odd split becomes
 /// an interleave, and the Taylor step runs backwards. Rescaling is diagonal and self-transposed.
-#[cfg(any(feature = "decapsulate", test))]
+#[cfg(test)]
 fn coefficient_pass_transpose<P: Params>(
     coefficients: &mut [u16],
     scratch: &mut [u16],
@@ -341,6 +394,203 @@ fn coefficient_pass_transpose<P: Params>(
             for (coefficient, &power) in segment.iter_mut().zip(powers.iter()) {
                 *coefficient = P::Field::mul(*coefficient, power);
             }
+        }
+    }
+}
+
+/// The lanes holding the low half of a 128-lane pair.
+const LOW_HALF: Word = (1 << 64) - 1;
+
+/// A mask that repeats every `period` lanes, set on lanes `[lo, hi)` of each period.
+fn periodic_mask(period: usize, lo: usize, hi: usize) -> Word {
+    debug_assert!(period <= LANES && lo < hi && hi <= period);
+    let one: Word = 1;
+    let run: Word = (one << (hi - lo)) - 1;
+    let mut mask: Word = 0;
+    let mut base = 0;
+    while base < LANES {
+        mask |= run << (base + lo);
+        base += period;
+    }
+    mask
+}
+
+/// Exchange the bits `distance` apart selected by `mask`, which marks each pair's lower lane.
+#[inline(always)]
+fn delta_swap(word: Word, mask: Word, distance: usize) -> Word {
+    let t = (word ^ (word >> distance)) & mask;
+    word ^ t ^ (t << distance)
+}
+
+/// Pack scalar coefficients into bit-sliced groups, one lane per coefficient.
+fn pack_lanes<P: Params>(planes: &mut [Word], values: &[u16]) {
+    let bits = P::M;
+    for (g, group) in planes.chunks_exact_mut(bits).enumerate() {
+        group.fill(0);
+        for lane in 0..LANES.min(values.len() - (g * LANES).min(values.len())) {
+            let value = values[g * LANES + lane];
+            for (i, plane) in group.iter_mut().enumerate() {
+                *plane |= Word::from((value >> i) & 1) << lane;
+            }
+        }
+    }
+}
+
+/// The inverse of [`pack_lanes`].
+fn unpack_lanes<P: Params>(values: &mut [u16], planes: &[Word]) {
+    let bits = P::M;
+    for (index, value) in values.iter_mut().enumerate() {
+        let group = &planes[(index / LANES) * bits..(index / LANES) * bits + bits];
+        let lane = index % LANES;
+        let mut assembled = 0u16;
+        for (i, &plane) in group.iter().enumerate() {
+            assembled |= (((plane >> lane) & 1) as u16) << i;
+        }
+        *value = assembled;
+    }
+}
+
+/// [`coefficient_pass`] on bit-sliced coefficients: the rescale becomes one multiply per
+/// group, and the Taylor fold and even-odd split become fixed masked shifts on the planes.
+///
+/// The scalar pass costs `levels * length` field multiplications and as many shuffled copies;
+/// this form costs `levels * length / 128` bit-sliced multiplies and a few dozen word
+/// operations per plane per level. The sequential Taylor fold splits into two masked quarter
+/// folds run high-to-low, matching the scalar loop's reverse iteration, and the even-odd
+/// split is the classic delta-swap unshuffle. Every mask and shift is a public function of
+/// the block size.
+fn coefficient_pass_sliced<P: Params>(
+    planes: &mut [Word],
+    tables: &Tables<P::Field>,
+    plan: &Levels,
+    levels: usize,
+    length: usize,
+) {
+    let bits = P::M;
+    let groups = length.div_ceil(LANES);
+    debug_assert_eq!(planes.len(), groups * bits);
+    let variant = plan.sliced_variant(length);
+
+    let mut product: Slice = [0; MAX_BITS];
+    for depth in 0..levels {
+        let block = length >> depth;
+
+        for g in 0..groups {
+            let power = &plan.sliced_powers[plan.sliced_starts[variant][depth] + g];
+            let value = load(planes, g, bits);
+            tables.mul(&mut product, &value, power);
+            store(planes, g, bits, &product);
+        }
+
+        // The scalar fold `g[i - s/4] ^= g[i]` for descending `i` reads the third quarter
+        // after the fourth quarter has updated it, so it is two ordered quarter folds.
+        let mut s = block;
+        while s >= 4 {
+            if s > LANES {
+                debug_assert_eq!(s, 2 * LANES);
+                for i in 0..bits {
+                    let high = planes[bits + i] ^ (planes[bits + i] >> 64);
+                    planes[i] ^= (high & LOW_HALF) << 64;
+                    planes[bits + i] = high;
+                }
+            } else {
+                let quarter = s / 4;
+                let fourth = periodic_mask(s, 3 * s / 4, s);
+                let third = periodic_mask(s, s / 2, 3 * s / 4);
+                for word in planes.iter_mut() {
+                    *word ^= (*word & fourth) >> quarter;
+                    *word ^= (*word & third) >> quarter;
+                }
+            }
+            s >>= 1;
+        }
+
+        // Perfect unshuffle of each block: even lanes to the lower half, odd to the upper.
+        let mut d = 1;
+        while 4 * d <= block {
+            if 4 * d > LANES {
+                debug_assert_eq!(d, 64);
+                for i in 0..bits {
+                    let t = (planes[i] ^ (planes[bits + i] << 64)) & !LOW_HALF;
+                    planes[i] ^= t;
+                    planes[bits + i] ^= t >> 64;
+                }
+            } else {
+                let mask = periodic_mask(4 * d, d, 2 * d);
+                for word in planes.iter_mut() {
+                    *word = delta_swap(*word, mask, d);
+                }
+            }
+            d <<= 1;
+        }
+    }
+}
+
+/// The transpose of [`coefficient_pass_sliced`]: levels reverse, the unshuffle becomes a
+/// shuffle by running its involutive steps backwards, and the fold runs low-to-high.
+fn coefficient_pass_transpose_sliced<P: Params>(
+    planes: &mut [Word],
+    tables: &Tables<P::Field>,
+    plan: &Levels,
+    levels: usize,
+    length: usize,
+) {
+    let bits = P::M;
+    let groups = length.div_ceil(LANES);
+    debug_assert_eq!(planes.len(), groups * bits);
+    let variant = plan.sliced_variant(length);
+
+    let mut product: Slice = [0; MAX_BITS];
+    for depth in (0..levels).rev() {
+        let block = length >> depth;
+
+        let mut d = block / 4;
+        while d >= 1 {
+            if 4 * d > LANES {
+                debug_assert_eq!(d, 64);
+                for i in 0..bits {
+                    let t = (planes[i] ^ (planes[bits + i] << 64)) & !LOW_HALF;
+                    planes[i] ^= t;
+                    planes[bits + i] ^= t >> 64;
+                }
+            } else {
+                let mask = periodic_mask(4 * d, d, 2 * d);
+                for word in planes.iter_mut() {
+                    *word = delta_swap(*word, mask, d);
+                }
+            }
+            d >>= 1;
+        }
+
+        // Transposing the two ordered quarter folds reverses their order and direction: the
+        // scalar loop `g[i] ^= g[i - s/4]` for ascending `i` reads the third quarter after
+        // the second quarter has updated it.
+        let mut s = 4;
+        while s <= block {
+            if s > LANES {
+                debug_assert_eq!(s, 2 * LANES);
+                for i in 0..bits {
+                    let mut high = planes[bits + i] ^ (planes[i] >> 64);
+                    high ^= (high & LOW_HALF) << 64;
+                    planes[bits + i] = high;
+                }
+            } else {
+                let quarter = s / 4;
+                let second = periodic_mask(s, s / 4, s / 2);
+                let third = periodic_mask(s, s / 2, 3 * s / 4);
+                for word in planes.iter_mut() {
+                    *word ^= (*word & second) << quarter;
+                    *word ^= (*word & third) << quarter;
+                }
+            }
+            s <<= 1;
+        }
+
+        for g in 0..groups {
+            let power = &plan.sliced_powers[plan.sliced_starts[variant][depth] + g];
+            let value = load(planes, g, bits);
+            tables.mul(&mut product, &value, power);
+            store(planes, g, bits, &product);
         }
     }
 }
@@ -532,12 +782,16 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
     debug_assert!(plan.count >= levels);
 
     let workspace_length = storage.len() / 2;
-    let (coefficients, scratch) = storage.split_at_mut(workspace_length);
+    let (coefficients, _) = storage.split_at_mut(workspace_length);
     let coefficients = &mut coefficients[..length];
-    let scratch = &mut scratch[..length];
     coefficients.fill(0);
     coefficients[..f.len()].copy_from_slice(f);
-    coefficient_pass::<P>(coefficients, scratch, plan, levels);
+
+    let mut planes: [Word; 2 * MAX_BITS] = [0; 2 * MAX_BITS];
+    let planes = &mut planes[..length.div_ceil(LANES) * bits];
+    pack_lanes::<P>(planes, coefficients);
+    coefficient_pass_sliced::<P>(planes, tables, plan, levels, length);
+    unpack_lanes::<P>(coefficients, planes);
 
     // Leaves, built directly as bit-planes. Each constant covers `span` consecutive lanes.
     let span = P::Q >> levels;
@@ -680,7 +934,7 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
     // bit-sliced form is the parity of each masked bit-plane.
     let span = P::Q >> levels;
     let coefficients = &mut coefficients[..length];
-    let scratch = &mut scratch[..length];
+    let _ = scratch;
     for (leaf, slot) in coefficients.iter_mut().enumerate() {
         let start = leaf * span;
         let mut value = 0u16;
@@ -704,7 +958,11 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
         *slot = value;
     }
 
-    coefficient_pass_transpose::<P>(coefficients, scratch, plan, levels);
+    let mut planes: [Word; 2 * MAX_BITS] = [0; 2 * MAX_BITS];
+    let planes = &mut planes[..length.div_ceil(LANES) * bits];
+    pack_lanes::<P>(planes, coefficients);
+    coefficient_pass_transpose_sliced::<P>(planes, tables, plan, levels, length);
+    unpack_lanes::<P>(coefficients, planes);
     out.copy_from_slice(&coefficients[..out.len()]);
 }
 
