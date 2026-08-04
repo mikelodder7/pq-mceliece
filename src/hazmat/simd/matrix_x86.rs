@@ -569,6 +569,230 @@ unsafe fn xor_sources_pair_avx2<const N: usize>(
     }
 }
 
+/// How many trailing rows stream past the register-resident panel rows per tile.
+///
+/// Tiling bounds the strided working set of one chunk-column pass to `TRAILING_TILE` cache
+/// lines, so successive chunk columns of the same tile hit L2 instead of walking the whole
+/// trailing region again.
+const TRAILING_TILE: usize = 64;
+
+#[target_feature(enable = "avx512f")]
+unsafe fn fold_trailing_avx512(
+    panel: *mut u64,
+    trailing: *const u64,
+    stride: usize,
+    len: usize,
+    trailing_rows: usize,
+    carried: &[u64; 8],
+    taken: *const u64,
+) {
+    use core::arch::x86_64::{
+        _mm512_loadu_epi64, _mm512_set1_epi64, _mm512_storeu_epi64, _mm512_ternarylogic_epi64,
+    };
+
+    // SAFETY: the caller guarantees eight panel rows of `stride` words at `panel`,
+    // `trailing_rows` rows of `stride` words at `trailing`, `len` valid words per row from
+    // the given offset, one `taken` word per trailing row, and that the regions are disjoint.
+    unsafe {
+        let mut masks = [[0u64; 8]; TRAILING_TILE];
+        let mut tile_start = 0;
+        while tile_start < trailing_rows {
+            let tile_end = (tile_start + TRAILING_TILE).min(trailing_rows);
+
+            // The parity masks depend on the trailing row alone, so they are computed once
+            // per tile; inside the fold each mask reaches the ternary-logic op as a
+            // broadcast memory operand, keeping the vector ports for the folds themselves.
+            for (slots, t) in masks.iter_mut().zip(tile_start..tile_end) {
+                let took = *taken.add(t);
+                for (slot, &row_carried) in slots.iter_mut().zip(carried.iter()) {
+                    *slot = 0u64.wrapping_sub(u64::from((row_carried & took).count_ones() & 1));
+                }
+            }
+
+            let mut i = 0;
+            while i + AVX512_LANES <= len {
+                // The eight panel rows stay in registers for the whole tile, so the fold
+                // costs one source load and eight ternary-logic ops per trailing row
+                // instead of eight destination loads and stores each.
+                let mut accs = [
+                    _mm512_loadu_epi64(panel.add(i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(stride + i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(2 * stride + i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(3 * stride + i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(4 * stride + i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(5 * stride + i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(6 * stride + i) as *const i64),
+                    _mm512_loadu_epi64(panel.add(7 * stride + i) as *const i64),
+                ];
+                for (row_masks, t) in masks.iter().zip(tile_start..tile_end) {
+                    let s = _mm512_loadu_epi64(trailing.add(t * stride + i) as *const i64);
+                    for (acc, &mask) in accs.iter_mut().zip(row_masks.iter()) {
+                        *acc = _mm512_ternarylogic_epi64::<0x78>(
+                            *acc,
+                            s,
+                            _mm512_set1_epi64(mask as i64),
+                        );
+                    }
+                }
+                for (row, &acc) in accs.iter().enumerate() {
+                    _mm512_storeu_epi64(panel.add(row * stride + i) as *mut i64, acc);
+                }
+                i += AVX512_LANES;
+            }
+            while i < len {
+                let mut accs = [0u64; 8];
+                for (slot, row) in accs.iter_mut().zip(0..8) {
+                    *slot = *panel.add(row * stride + i);
+                }
+                for (row_masks, t) in masks.iter().zip(tile_start..tile_end) {
+                    let s = *trailing.add(t * stride + i);
+                    for (acc, &mask) in accs.iter_mut().zip(row_masks.iter()) {
+                        *acc ^= s & mask;
+                    }
+                }
+                for (row, &acc) in accs.iter().enumerate() {
+                    *panel.add(row * stride + i) = acc;
+                }
+                i += 1;
+            }
+
+            tile_start = tile_end;
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn fold_trailing_avx2(
+    panel: *mut u64,
+    trailing: *const u64,
+    stride: usize,
+    len: usize,
+    trailing_rows: usize,
+    carried: &[u64; 8],
+    taken: *const u64,
+) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_storeu_si256,
+        _mm256_xor_si256,
+    };
+
+    // SAFETY: same contract as the 512-bit kernel above.
+    unsafe {
+        let mut masks = [[0u64; 8]; TRAILING_TILE];
+        let mut tile_start = 0;
+        while tile_start < trailing_rows {
+            let tile_end = (tile_start + TRAILING_TILE).min(trailing_rows);
+
+            for (slots, t) in masks.iter_mut().zip(tile_start..tile_end) {
+                let took = *taken.add(t);
+                for (slot, &row_carried) in slots.iter_mut().zip(carried.iter()) {
+                    *slot = 0u64.wrapping_sub(u64::from((row_carried & took).count_ones() & 1));
+                }
+            }
+
+            let mut i = 0;
+            while i + AVX2_LANES <= len {
+                let mut accs = [
+                    _mm256_loadu_si256(panel.add(i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(stride + i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(2 * stride + i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(3 * stride + i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(4 * stride + i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(5 * stride + i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(6 * stride + i) as *const __m256i),
+                    _mm256_loadu_si256(panel.add(7 * stride + i) as *const __m256i),
+                ];
+                for (row_masks, t) in masks.iter().zip(tile_start..tile_end) {
+                    let s = _mm256_loadu_si256(trailing.add(t * stride + i) as *const __m256i);
+                    for (acc, &mask) in accs.iter_mut().zip(row_masks.iter()) {
+                        *acc = _mm256_xor_si256(
+                            *acc,
+                            _mm256_and_si256(s, _mm256_set1_epi64x(mask as i64)),
+                        );
+                    }
+                }
+                for (row, &acc) in accs.iter().enumerate() {
+                    _mm256_storeu_si256(panel.add(row * stride + i) as *mut __m256i, acc);
+                }
+                i += AVX2_LANES;
+            }
+            while i < len {
+                let mut accs = [0u64; 8];
+                for (slot, row) in accs.iter_mut().zip(0..8) {
+                    *slot = *panel.add(row * stride + i);
+                }
+                for (row_masks, t) in masks.iter().zip(tile_start..tile_end) {
+                    let s = *trailing.add(t * stride + i);
+                    for (acc, &mask) in accs.iter_mut().zip(row_masks.iter()) {
+                        *acc ^= s & mask;
+                    }
+                }
+                for (row, &acc) in accs.iter().enumerate() {
+                    *panel.add(row * stride + i) = acc;
+                }
+                i += 1;
+            }
+
+            tile_start = tile_end;
+        }
+    }
+}
+
+/// Fold every trailing row into eight panel rows, each gated by the parity of one `AND`.
+///
+/// `panel` holds eight complete rows of `stride` words; `trailing` holds the rows below the
+/// panel and `taken` one selection word per trailing row. Row `i` of the panel accumulates
+/// trailing row `t` exactly when `carried[i] & taken[t]` has odd weight. Only words
+/// `first..stride` are touched. The panel rows ride in registers while the trailing rows
+/// stream past, which replaces the eight destination loads and stores per trailing row of
+/// the row-blocked shape with one source load; XOR commutes, so the result is identical.
+#[inline(never)]
+pub(crate) fn fold_trailing_if(
+    panel: &mut [u64],
+    trailing: &[u64],
+    stride: usize,
+    first: usize,
+    carried: &[u64; 8],
+    taken: &[u64],
+) {
+    debug_assert_eq!(panel.len(), 8 * stride);
+    debug_assert_eq!(trailing.len(), taken.len() * stride);
+    debug_assert!(first <= stride);
+
+    let len = stride - first;
+    if len == 0 || taken.is_empty() {
+        return;
+    }
+
+    // SAFETY: `panel` is exactly eight rows and `trailing` exactly `taken.len()` rows of
+    // `stride` words, so `first + len == stride` words are in bounds for every row; the
+    // slices come from disjoint borrows, and the detected level guarantees the target
+    // features.
+    unsafe {
+        let dst = panel.as_mut_ptr().add(first);
+        let src = trailing.as_ptr().add(first);
+        match level() {
+            Level::Avx512 => {
+                fold_trailing_avx512(dst, src, stride, len, taken.len(), carried, taken.as_ptr())
+            }
+            Level::Avx2 => {
+                fold_trailing_avx2(dst, src, stride, len, taken.len(), carried, taken.as_ptr())
+            }
+            Level::Scalar => {
+                for (t, &took) in taken.iter().enumerate() {
+                    for (row, &row_carried) in carried.iter().enumerate() {
+                        let mask =
+                            0u64.wrapping_sub(u64::from((row_carried & took).count_ones() & 1));
+                        for i in 0..len {
+                            *dst.add(row * stride + i) ^= *src.add(t * stride + i) & mask;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// XOR `N` masked source rows into each of two destination rows, one source pass for both.
 ///
 /// `destinations` holds two complete, consecutive rows of `stride` words; `sources` holds `N`

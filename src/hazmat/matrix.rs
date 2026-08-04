@@ -1379,22 +1379,45 @@ impl BitMatrix {
 
         // First the trailing rows, once. Row `j` belongs in panel row `i` when an odd number of
         // the accumulations `i` carries actually took `j`, which is the parity of one `AND`.
+        // Every trailing row is applied to every panel row unconditionally, masked. An earlier
+        // version skipped rows whose conditions were all zero, which is a branch on secret
+        // matrix bits and therefore a timing oracle for how the pivots fell. The skip is not
+        // available here at any price.
         {
             let trailing_start = (start + COUNT) * stride;
             let (before, rest) = self.data.split_at_mut(trailing_start);
             let block = &mut before[block_start..block_start + COUNT * stride];
 
-            for (offset, source) in rest.chunks_exact(stride).enumerate() {
-                let taken = scratch.direct[start + COUNT + offset];
-                let mut conditions = [0u64; 32];
-                for (i, condition) in conditions.iter_mut().enumerate().take(COUNT) {
-                    *condition = u64::from((carried[i] & taken).count_ones() & 1);
+            if cfg!(target_arch = "x86_64") && COUNT.is_multiple_of(8) {
+                // Eight panel rows at a time ride in registers while the whole trailing
+                // stream folds past them; the parity conditions are recomputed from
+                // `carried` inside the kernel.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let trailing_rows = rest.len() / stride;
+                    let taken = &scratch.direct[start + COUNT..start + COUNT + trailing_rows];
+                    for (group, rows) in block.chunks_exact_mut(8 * stride).enumerate() {
+                        let mut group_carried = [0u64; 8];
+                        group_carried.copy_from_slice(&carried[8 * group..8 * group + 8]);
+                        super::simd::matrix_x86::fold_trailing_if(
+                            rows,
+                            rest,
+                            stride,
+                            first,
+                            &group_carried,
+                            taken,
+                        );
+                    }
                 }
-                // Every trailing row is applied to every panel row unconditionally, masked. An
-                // earlier version skipped rows whose conditions were all zero, which is a branch
-                // on secret matrix bits and therefore a timing oracle for how the pivots fell.
-                // The skip is not available here at any price.
-                apply_to_panel::<COUNT>(block, source, stride, first, &conditions);
+            } else {
+                for (offset, source) in rest.chunks_exact(stride).enumerate() {
+                    let taken = scratch.direct[start + COUNT + offset];
+                    let mut conditions = [0u64; 32];
+                    for (i, condition) in conditions.iter_mut().enumerate().take(COUNT) {
+                        *condition = u64::from((carried[i] & taken).count_ones() & 1);
+                    }
+                    apply_to_panel::<COUNT>(block, source, stride, first, &conditions);
+                }
             }
         }
 
