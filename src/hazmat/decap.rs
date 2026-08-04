@@ -321,8 +321,11 @@ fn berlekamp_massey_128<P: Params>(out: &mut [u16], syndrome: &[u16], tables: &T
 
         let mut scaled_previous = [0; MAX_BITS];
         let mut scaled_current = [0; MAX_BITS];
-        tables.mul(&mut scaled_previous, &discrepancy_broadcast, &previous[0]);
-        tables.mul(&mut scaled_current, &base_broadcast, &current[0]);
+        tables.mul_pair(
+            (&mut scaled_previous, &mut scaled_current),
+            (&discrepancy_broadcast, &base_broadcast),
+            (&previous[0], &current[0]),
+        );
 
         let select = 0u128.wrapping_sub(Word::from(grow & 1));
         for plane in 0..P::M {
@@ -425,12 +428,11 @@ fn berlekamp_massey<P: Params>(out: &mut [u16], syndrome: &[u16], tables: &Table
         for group in 0..group_count {
             let mut scaled_previous = [0; MAX_BITS];
             let mut scaled_current = [0; MAX_BITS];
-            tables.mul(
-                &mut scaled_previous,
-                &discrepancy_broadcast,
-                &previous[group],
+            tables.mul_pair(
+                (&mut scaled_previous, &mut scaled_current),
+                (&discrepancy_broadcast, &base_broadcast),
+                (&previous[group], &current[group]),
             );
-            tables.mul(&mut scaled_current, &base_broadcast, &current[group]);
             for plane in 0..P::M {
                 previous[group][plane] =
                     (previous[group][plane] & !select) | (current[group][plane] & select);

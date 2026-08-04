@@ -276,6 +276,38 @@ impl<F: Field> Tables<F> {
         }
     }
 
+    /// Two independent multiplies of bit-sliced groups, in one pass where the hardware
+    /// carries them.
+    ///
+    /// Berlekamp--Massey scales two polynomials by two independent constants at every step;
+    /// pairing the multiplies halves the fused convolution's instruction count on AVX-512
+    /// hosts. Everywhere else this is exactly two calls to [`Tables::mul`], in order.
+    pub(crate) fn mul_pair(
+        &self,
+        out: (&mut Slice, &mut Slice),
+        a: (&Slice, &Slice),
+        b: (&Slice, &Slice),
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if self.fused {
+            use crate::hazmat::simd::vec_x86;
+            // SAFETY: `fused` was set from a CPUID probe, so `avx512f` and `avx512vl` are
+            // both present. The two outputs are distinct `&mut` borrows and cannot alias
+            // the operands.
+            unsafe {
+                if F::BITS == 12 {
+                    vec_x86::mul_fused_pair::<12>(out, a, b);
+                } else {
+                    debug_assert_eq!(F::BITS, 13);
+                    vec_x86::mul_fused_pair::<13>(out, a, b);
+                }
+            }
+            return;
+        }
+        self.mul(out.0, a.0, b.0);
+        self.mul(out.1, a.1, b.1);
+    }
+
     /// Multiply two 64-lane bit-sliced groups lane by lane.
     ///
     /// Degree 64 has exactly one machine word of non-leading coefficients, so using a `u64`

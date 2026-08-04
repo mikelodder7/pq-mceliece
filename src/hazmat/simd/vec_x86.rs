@@ -56,32 +56,34 @@ fn plain_and_xor(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
     unsafe { _mm_xor_si128(a, _mm_and_si128(b, c)) }
 }
 
-/// The bit-sliced multiply, parameterized on how its inner step accumulates.
+/// The bit-sliced multiply, parameterized on how its inner step accumulates and on how planes
+/// enter and leave the registers.
 ///
-/// The two instantiations differ in one operation and nothing else, so the convolution and the
-/// reduction live here once rather than in each. A macro rather than a function parameter because
-/// the fused instantiation carries `#[target_feature]`, and a closure passed across that boundary
-/// would not inline.
+/// The instantiations differ in the accumulate operation and the register width and nothing
+/// else, so the convolution and the reduction live here once rather than in each. A macro
+/// rather than a function parameter because the fused instantiations carry
+/// `#[target_feature]`, and a closure passed across that boundary would not inline.
 macro_rules! karatsuba_multiply {
-    ($accumulate:ident, $out:ident, $a:ident, $b:ident, $bits:ident) => {{
+    ($accumulate:ident, $xor:ident, $zero:expr, $load:ident, $store:ident,
+     $a:ident, $b:ident, $bits:ident) => {{
         // The split that balances the two halves: seven and six for degree thirteen, six and six
         // for degree twelve.
         let s = if $bits == 12 { 6 } else { 7 };
         let u = 6usize;
 
-        let zero = _mm_setzero_si128();
+        let zero = $zero;
         let mut av = [zero; MAX_BITS];
         let mut bv = [zero; MAX_BITS];
         for i in 0..$bits {
-            av[i] = to_vector($a[i]);
-            bv[i] = to_vector($b[i]);
+            av[i] = $load!($a, i);
+            bv[i] = $load!($b, i);
         }
 
         let mut a_sum = [zero; 7];
         let mut b_sum = [zero; 7];
         for i in 0..u {
-            a_sum[i] = _mm_xor_si128(av[i], av[i + s]);
-            b_sum[i] = _mm_xor_si128(bv[i], bv[i + s]);
+            a_sum[i] = $xor(av[i], av[i + s]);
+            b_sum[i] = $xor(bv[i], bv[i + s]);
         }
         if u < s {
             a_sum[u] = av[u];
@@ -105,12 +107,12 @@ macro_rules! karatsuba_multiply {
 
         let mut product = [zero; 2 * MAX_BITS - 1];
         for i in 0..2 * s - 1 {
-            product[i] = _mm_xor_si128(product[i], low[i]);
-            let combined = _mm_xor_si128(_mm_xor_si128(middle[i], low[i]), high[i]);
-            product[i + s] = _mm_xor_si128(product[i + s], combined);
+            product[i] = $xor(product[i], low[i]);
+            let combined = $xor($xor(middle[i], low[i]), high[i]);
+            product[i + s] = $xor(product[i + s], combined);
         }
         for i in 0..2 * u - 1 {
-            product[i + 2 * s] = _mm_xor_si128(product[i + 2 * s], high[i]);
+            product[i + 2 * s] = $xor(product[i + 2 * s], high[i]);
         }
 
         // Fold the top half down through the standardized sparse field polynomial, highest degree
@@ -119,24 +121,24 @@ macro_rules! karatsuba_multiply {
         if $bits == 12 {
             for d in (0..11).rev() {
                 let top = product[12 + d];
-                product[d + 3] = _mm_xor_si128(product[d + 3], top);
-                product[d] = _mm_xor_si128(product[d], top);
+                product[d + 3] = $xor(product[d + 3], top);
+                product[d] = $xor(product[d], top);
             }
         } else {
             for d in (0..12).rev() {
                 let top = product[13 + d];
-                product[d + 4] = _mm_xor_si128(product[d + 4], top);
-                product[d + 3] = _mm_xor_si128(product[d + 3], top);
-                product[d + 1] = _mm_xor_si128(product[d + 1], top);
-                product[d] = _mm_xor_si128(product[d], top);
+                product[d + 4] = $xor(product[d + 4], top);
+                product[d + 3] = $xor(product[d + 3], top);
+                product[d + 1] = $xor(product[d + 1], top);
+                product[d] = $xor(product[d], top);
             }
         }
 
         for i in 0..$bits {
-            $out[i] = from_vector(product[i]);
+            $store!(i, product[i]);
         }
-        for slot in $out.iter_mut().skip($bits) {
-            *slot = 0;
+        for i in $bits..MAX_BITS {
+            $store!(i, zero);
         }
     }};
 }
@@ -153,11 +155,30 @@ pub(crate) fn mul<const BITS: usize>(
 ) {
     debug_assert!(BITS == 12 || BITS == 13);
 
+    macro_rules! load {
+        ($src:ident, $i:expr) => {
+            to_vector($src[$i])
+        };
+    }
+    macro_rules! store {
+        ($i:expr, $v:expr) => {
+            out[$i] = from_vector($v)
+        };
+    }
     // SAFETY: every intrinsic reached from here is `sse2`, which is part of the x86-64 baseline
     // and so unconditionally present on this target. The `unsafe` is a formality of the intrinsic
     // signatures, not a real precondition. None of them touches memory.
     unsafe {
-        karatsuba_multiply!(plain_and_xor, out, a, b, BITS);
+        karatsuba_multiply!(
+            plain_and_xor,
+            _mm_xor_si128,
+            _mm_setzero_si128(),
+            load,
+            store,
+            a,
+            b,
+            BITS
+        );
     }
 }
 
@@ -178,10 +199,77 @@ pub(crate) unsafe fn mul_fused<const BITS: usize>(
 ) {
     debug_assert!(BITS == 12 || BITS == 13);
 
+    macro_rules! load {
+        ($src:ident, $i:expr) => {
+            to_vector($src[$i])
+        };
+    }
+    macro_rules! store {
+        ($i:expr, $v:expr) => {
+            out[$i] = from_vector($v)
+        };
+    }
     // SAFETY: this function's own target features cover every intrinsic reached from here, and
     // none of them touches memory.
     unsafe {
-        karatsuba_multiply!(fused_and_xor, out, a, b, BITS);
+        karatsuba_multiply!(
+            fused_and_xor,
+            _mm_xor_si128,
+            _mm_setzero_si128(),
+            load,
+            store,
+            a,
+            b,
+            BITS
+        );
+    }
+}
+
+/// Two independent multiplies in one pass, one per 128-bit half of each 256-bit register.
+///
+/// Berlekamp--Massey scales two polynomials by two independent constants at every step;
+/// carrying both multiplies in one register file halves the convolution's instruction count
+/// and lets every spill of the register-starved Karatsuba serve both at once.
+///
+/// # Safety
+///
+/// The host must support `avx512f` and `avx512vl`.
+#[target_feature(enable = "avx512f,avx512vl")]
+pub(crate) unsafe fn mul_fused_pair<const BITS: usize>(
+    out: (&mut [u128; MAX_BITS], &mut [u128; MAX_BITS]),
+    a: (&[u128; MAX_BITS], &[u128; MAX_BITS]),
+    b: (&[u128; MAX_BITS], &[u128; MAX_BITS]),
+) {
+    use core::arch::x86_64::_mm256_setzero_si256;
+
+    debug_assert!(BITS == 12 || BITS == 13);
+
+    let (out0, out1) = out;
+    macro_rules! load {
+        ($src:ident, $i:expr) => {
+            pack_pair($src.0[$i], $src.1[$i])
+        };
+    }
+    macro_rules! store {
+        ($i:expr, $v:expr) => {{
+            let value = $v;
+            out0[$i] = low_half(value);
+            out1[$i] = high_half(value);
+        }};
+    }
+    // SAFETY: this function's own target features cover every intrinsic reached from here
+    // (`avx512vl` implies the `avx2` forms), and none of them touches memory.
+    unsafe {
+        karatsuba_multiply!(
+            fused_and_xor_pair,
+            xor_pair,
+            _mm256_setzero_si256(),
+            load,
+            store,
+            a,
+            b,
+            BITS
+        );
     }
 }
 
@@ -271,6 +359,55 @@ unsafe fn fused_and_xor(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
     _mm_ternarylogic_epi64::<0x78>(a, b, c)
 }
 
+/// The 256-bit form of [`fused_and_xor`], carrying two independent lanes.
+///
+/// # Safety
+///
+/// The host must support `avx512f` and `avx512vl`; the 256-bit width is what needs `vl`.
+#[target_feature(enable = "avx512f,avx512vl")]
+#[inline]
+unsafe fn fused_and_xor_pair(
+    a: core::arch::x86_64::__m256i,
+    b: core::arch::x86_64::__m256i,
+    c: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::_mm256_ternarylogic_epi64;
+    _mm256_ternarylogic_epi64::<0x78>(a, b, c)
+}
+
+/// The 256-bit exclusive-or, named so the shared Karatsuba body can take it as a parameter.
+#[inline(always)]
+fn xor_pair(
+    a: core::arch::x86_64::__m256i,
+    b: core::arch::x86_64::__m256i,
+) -> core::arch::x86_64::__m256i {
+    // SAFETY: only reached from `mul_fused_pair`, whose target features imply `avx2`. The
+    // operation is fixed-latency and touches no memory.
+    unsafe { core::arch::x86_64::_mm256_xor_si256(a, b) }
+}
+
+/// Two bit-planes side by side in one 256-bit register.
+#[inline(always)]
+fn pack_pair(low: u128, high: u128) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::{_mm256_inserti128_si256, _mm256_zextsi128_si256};
+    // SAFETY: as in `xor_pair`; both intrinsics are register-only `avx`/`avx2` forms.
+    unsafe { _mm256_inserti128_si256::<1>(_mm256_zextsi128_si256(to_vector(low)), to_vector(high)) }
+}
+
+/// The low half of a packed pair.
+#[inline(always)]
+fn low_half(value: core::arch::x86_64::__m256i) -> u128 {
+    // SAFETY: as in `xor_pair`.
+    unsafe { from_vector(core::arch::x86_64::_mm256_castsi256_si128(value)) }
+}
+
+/// The high half of a packed pair.
+#[inline(always)]
+fn high_half(value: core::arch::x86_64::__m256i) -> u128 {
+    // SAFETY: as in `xor_pair`.
+    unsafe { from_vector(core::arch::x86_64::_mm256_extracti128_si256::<1>(value)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +446,53 @@ mod tests {
 
             assert_eq!(actual, expected);
         }
+    }
+
+    /// The paired fused multiply must agree with the portable multiply in both halves.
+    fn pair_matches_the_portable_multiply<const BITS: usize>(seed: u64) {
+        if !has_fused_and_xor() {
+            return;
+        }
+
+        let mut rng = SplitMix(seed);
+        for _ in 0..2000 {
+            let mut a = [[0u128; MAX_BITS]; 2];
+            let mut b = [[0u128; MAX_BITS]; 2];
+            for side in 0..2 {
+                for plane in 0..BITS {
+                    a[side][plane] = rng.word();
+                    b[side][plane] = rng.word();
+                }
+            }
+
+            let mut expected = [[0u128; MAX_BITS]; 2];
+            for side in 0..2 {
+                crate::hazmat::vec::portable_mul::<BITS>(&mut expected[side], &a[side], &b[side]);
+            }
+
+            let mut actual = [[0u128; MAX_BITS]; 2];
+            let (first, second) = actual.split_at_mut(1);
+            // SAFETY: `has_fused_and_xor` reported the required target features.
+            unsafe {
+                mul_fused_pair::<BITS>(
+                    (&mut first[0], &mut second[0]),
+                    (&a[0], &a[1]),
+                    (&b[0], &b[1]),
+                );
+            }
+
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn twelve_bit_pair_multiply_matches() {
+        pair_matches_the_portable_multiply::<12>(0x0F0E_0D0C_0B0A_0908);
+    }
+
+    #[test]
+    fn thirteen_bit_pair_multiply_matches() {
+        pair_matches_the_portable_multiply::<13>(0x1357_9BDF_0246_8ACE);
     }
 
     /// The register form of squaring must agree with the portable one on every plane.
