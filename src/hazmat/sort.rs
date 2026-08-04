@@ -377,6 +377,105 @@ fn sort_packed_i32_power_of_two_portable(x: &mut [i32]) {
     }
 }
 
+/// Advance eight strided chains of the `p = $p` stage through one whole `r` cascade.
+///
+/// At strides below four the runs are too short for the width cascade and the chain stage was
+/// measured spending half the whole sort in scalar compare-exchanges. Sixteen consecutive
+/// elements hold eight independent chains: their carries sit in lanes `p..2p-1` modulo `2p`
+/// of `x[index..index + 16]` and each step's windows in lanes `0..p-1` modulo `2p` of
+/// `x[index + r..]`, so one in-register shift by `p` lanes aligns a window load with the
+/// carries, and blends confine every write to its own residue class.
+///
+/// Running the eight cascades in lockstep over descending `r` preserves the scalar
+/// per-chain order exactly: any two chains that touch the same word do so with the later
+/// access at the smaller stride, and descending `r` replays those accesses in that order.
+/// The carries fold back through a reload-and-blend at the end, because head lanes double as
+/// other chains' window words while the cascade is in flight.
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+macro_rules! small_stride_chain_x86 {
+    ($(#[$meta:meta])* $name:ident, $p:literal, $up:expr, $down:expr,
+     $carry_blend:literal, $window_blend:literal) => {
+        $(#[$meta])*
+        #[target_feature(enable = "avx2")]
+        unsafe fn $name(base: *mut i32, q: usize) {
+            use core::arch::x86_64::{
+                __m256i, _mm256_blend_epi32, _mm256_loadu_si256, _mm256_max_epi32,
+                _mm256_min_epi32, _mm256_permutevar8x32_epi32, _mm256_setr_epi32,
+                _mm256_storeu_si256,
+            };
+
+            // SAFETY: the caller guarantees sixteen writable elements at `base` and sixteen
+            // readable, writable elements at every `base + r` the cascade visits. Unaligned
+            // forms throughout, so no alignment precondition applies.
+            unsafe {
+                let up = $up;
+                let down = $down;
+                let mut carry0 = _mm256_loadu_si256(base as *const __m256i);
+                let mut carry1 = _mm256_loadu_si256(base.add(8) as *const __m256i);
+
+                let mut r = q;
+                while r > $p {
+                    let window0 = base.add(r);
+                    let window1 = base.add(r + 8);
+                    let w0 = _mm256_loadu_si256(window0 as *const __m256i);
+                    let w1 = _mm256_loadu_si256(window1 as *const __m256i);
+                    let aligned0 = _mm256_permutevar8x32_epi32(w0, up);
+                    let aligned1 = _mm256_permutevar8x32_epi32(w1, up);
+
+                    let lo0 = _mm256_min_epi32(carry0, aligned0);
+                    let lo1 = _mm256_min_epi32(carry1, aligned1);
+                    let hi0 = _mm256_max_epi32(carry0, aligned0);
+                    let hi1 = _mm256_max_epi32(carry1, aligned1);
+                    carry0 = _mm256_blend_epi32::<$carry_blend>(carry0, lo0);
+                    carry1 = _mm256_blend_epi32::<$carry_blend>(carry1, lo1);
+
+                    let back0 = _mm256_permutevar8x32_epi32(hi0, down);
+                    let back1 = _mm256_permutevar8x32_epi32(hi1, down);
+                    _mm256_storeu_si256(
+                        window0 as *mut __m256i,
+                        _mm256_blend_epi32::<$window_blend>(w0, back0),
+                    );
+                    _mm256_storeu_si256(
+                        window1 as *mut __m256i,
+                        _mm256_blend_epi32::<$window_blend>(w1, back1),
+                    );
+                    r >>= 1;
+                }
+
+                let head0 = _mm256_loadu_si256(base as *const __m256i);
+                let head1 = _mm256_loadu_si256(base.add(8) as *const __m256i);
+                _mm256_storeu_si256(
+                    base as *mut __m256i,
+                    _mm256_blend_epi32::<$carry_blend>(head0, carry0),
+                );
+                _mm256_storeu_si256(
+                    base.add(8) as *mut __m256i,
+                    _mm256_blend_epi32::<$carry_blend>(head1, carry1),
+                );
+            }
+        }
+    };
+}
+
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+small_stride_chain_x86! {
+    /// Eight lockstep chains of the stride-one stage: carries in odd lanes, windows in even.
+    chain_batch_stride1_x86, 1,
+    _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6),
+    _mm256_setr_epi32(1, 2, 3, 4, 5, 6, 7, 7),
+    0b1010_1010, 0b0101_0101
+}
+
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+small_stride_chain_x86! {
+    /// Eight lockstep chains of the stride-two stage: carries in lanes two and three of each
+    /// four, windows in lanes zero and one.
+    chain_batch_stride2_x86, 2,
+    _mm256_setr_epi32(0, 0, 0, 1, 2, 3, 4, 5),
+    _mm256_setr_epi32(2, 3, 4, 5, 6, 7, 7, 7),
+    0b1100_1100, 0b0011_0011
+}
+
 /// The x86 vector form of the power-of-two sorter.
 ///
 /// The body is the portable sorter with the comparator width lifted to a cascade of vector
@@ -429,6 +528,27 @@ macro_rules! sort_packed_i32_pow2_x86 {
                 let mut q = top;
                 while q > p {
                     let limit = n - q;
+                    // Strides one and two never reach the width cascade below, so their
+                    // chains advance eight at a time in lockstep instead; see
+                    // [`small_stride_chain_x86`] for why the order is preserved. `index`
+                    // stays a multiple of `2p` across levels, which is the alignment the
+                    // batch's residue classes assume.
+                    if p <= 2 {
+                        while index + 16 <= limit {
+                            // SAFETY: `index + 16 <= limit = n - q` keeps the sixteen
+                            // carry words in bounds and every window below
+                            // `index + q + 15 <= n - 1`; the dispatched level guarantees
+                            // `avx2`.
+                            unsafe {
+                                if p == 1 {
+                                    chain_batch_stride1_x86(x.as_mut_ptr().add(index), q);
+                                } else {
+                                    chain_batch_stride2_x86(x.as_mut_ptr().add(index), q);
+                                }
+                            }
+                            index += 16;
+                        }
+                    }
                     while index < limit {
                         let block_end = (index | (p - 1)) + 1;
                         if index & p != 0 {
