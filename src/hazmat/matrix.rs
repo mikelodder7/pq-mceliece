@@ -116,14 +116,33 @@ fn xor_rows_portable<const COUNT: usize>(
     first: usize,
     conditions: &[u64; COUNT],
 ) {
-    for (row, &condition) in destinations
-        .chunks_exact_mut(stride)
-        .zip(conditions.iter())
-        .take(COUNT)
-    {
-        let mask = 0u64.wrapping_sub(condition);
-        for (target, &word) in row[first..].iter_mut().zip(source[first..].iter()) {
-            *target ^= word & mask;
+    debug_assert!(COUNT.is_multiple_of(4));
+    let mut rows = destinations.chunks_exact_mut(stride);
+    for quad in 0..COUNT / 4 {
+        // Four destination rows advance together: the source word is loaded once for all
+        // four, and four independent store streams stay in flight.
+        let (Some(r0), Some(r1), Some(r2), Some(r3)) =
+            (rows.next(), rows.next(), rows.next(), rows.next())
+        else {
+            return;
+        };
+        let masks: [u64; 4] = [
+            0u64.wrapping_sub(conditions[4 * quad]),
+            0u64.wrapping_sub(conditions[4 * quad + 1]),
+            0u64.wrapping_sub(conditions[4 * quad + 2]),
+            0u64.wrapping_sub(conditions[4 * quad + 3]),
+        ];
+        for ((((t0, t1), t2), t3), &word) in r0[first..]
+            .iter_mut()
+            .zip(r1[first..].iter_mut())
+            .zip(r2[first..].iter_mut())
+            .zip(r3[first..].iter_mut())
+            .zip(source[first..].iter())
+        {
+            *t0 ^= word & masks[0];
+            *t1 ^= word & masks[1];
+            *t2 ^= word & masks[2];
+            *t3 ^= word & masks[3];
         }
     }
 }
@@ -138,14 +157,31 @@ fn xor_sources_portable<const COUNT: usize>(
     first: usize,
     conditions: &[u64; COUNT],
 ) {
-    for (row, &condition) in sources
-        .chunks_exact(stride)
-        .zip(conditions.iter())
-        .take(COUNT)
-    {
-        let mask = 0u64.wrapping_sub(condition);
-        for (target, &word) in destination[first..].iter_mut().zip(row[first..].iter()) {
-            *target ^= word & mask;
+    debug_assert!(COUNT.is_multiple_of(4));
+    for quad in 0..COUNT / 4 {
+        // Four masked source rows fold into the destination per pass: a quarter of the
+        // destination read-and-write passes, with four load streams in flight.
+        let row = |r: usize| &sources[r * stride..(r + 1) * stride][first..];
+        let (r0, r1, r2, r3) = (
+            row(4 * quad),
+            row(4 * quad + 1),
+            row(4 * quad + 2),
+            row(4 * quad + 3),
+        );
+        let masks: [u64; 4] = [
+            0u64.wrapping_sub(conditions[4 * quad]),
+            0u64.wrapping_sub(conditions[4 * quad + 1]),
+            0u64.wrapping_sub(conditions[4 * quad + 2]),
+            0u64.wrapping_sub(conditions[4 * quad + 3]),
+        ];
+        for ((((target, &a), &b), &c), &d) in destination[first..]
+            .iter_mut()
+            .zip(r0.iter())
+            .zip(r1.iter())
+            .zip(r2.iter())
+            .zip(r3.iter())
+        {
+            *target ^= (a & masks[0]) ^ (b & masks[1]) ^ (c & masks[2]) ^ (d & masks[3]);
         }
     }
 }
