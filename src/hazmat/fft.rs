@@ -597,28 +597,15 @@ pub(crate) fn eval_all_bitrev_sliced<P: Params>(
                 }
             }
         } else {
-            // The pair sits inside one group, `half` lanes apart.
+            // The pair sits inside one group, `half` lanes apart. Every standardized
+            // parameter set reaches only two narrow widths, and a constant width turns each
+            // 128-bit shift into one instruction where the variable form compiles to a
+            // test-and-select chain per plane per group.
             let omega = &plan.omegas[plan.omega_starts[depth]];
-            let keep = lane_run_mask(half);
-
-            for group in 0..groups {
-                let word = load(out, group, bits);
-                let mut low = [0; MAX_BITS];
-                let mut high = [0; MAX_BITS];
-                for i in 0..bits {
-                    low[i] = word[i] & keep;
-                    high[i] = (word[i] >> half) & keep;
-                }
-
-                tables.mul(&mut product, &high, omega);
-                let mut merged = [0; MAX_BITS];
-                for i in 0..bits {
-                    let new_low = low[i] ^ product[i];
-                    let new_high = new_low ^ high[i];
-                    merged[i] = new_low | (new_high << half);
-                }
-
-                store(out, group, bits, &merged);
+            match half {
+                64 => narrow_forward_level::<P>(out, omega, tables, &mut product, 64),
+                32 => narrow_forward_level::<P>(out, omega, tables, &mut product, 32),
+                _ => narrow_forward_level::<P>(out, omega, tables, &mut product, half),
             }
         }
     }
@@ -678,30 +665,13 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
             }
         } else {
             let omega = &plan.omegas[plan.omega_starts[depth]];
-            let keep = lane_run_mask(half);
-
-            for group in 0..groups {
-                let word = load(work, group, bits);
-                let mut low = [0; MAX_BITS];
-                let mut high = [0; MAX_BITS];
-                for i in 0..bits {
-                    low[i] = word[i] & keep;
-                    high[i] = (word[i] >> half) & keep;
-                }
-
-                let mut sum = [0; MAX_BITS];
-                for i in 0..bits {
-                    sum[i] = low[i] ^ high[i];
-                }
-                tables.mul(&mut product, &sum, omega);
-
-                let mut merged = [0; MAX_BITS];
-                for i in 0..bits {
-                    let new_high = high[i] ^ product[i];
-                    merged[i] = sum[i] | (new_high << half);
-                }
-
-                store(work, group, bits, &merged);
+            // Every standardized parameter set reaches only these two narrow widths, and a
+            // constant width turns each 128-bit shift into one instruction where the
+            // variable form compiles to a test-and-select chain per plane per group.
+            match half {
+                64 => narrow_transpose_level::<P>(work, omega, tables, &mut product, 64),
+                32 => narrow_transpose_level::<P>(work, omega, tables, &mut product, 32),
+                _ => narrow_transpose_level::<P>(work, omega, tables, &mut product, half),
             }
         }
     }
@@ -736,6 +706,83 @@ pub(crate) fn eval_transpose_bitrev_sliced<P: Params>(
 
     coefficient_pass_transpose::<P>(coefficients, scratch, plan, levels);
     out.copy_from_slice(&coefficients[..out.len()]);
+}
+
+/// One narrow level of the forward transform, where each pair sits `half` lanes apart inside
+/// one group.
+///
+/// `#[inline(always)]` so the constant `half` the standardized dispatch passes propagates
+/// into the shifts; see the call sites.
+#[inline(always)]
+fn narrow_forward_level<P: Params>(
+    out: &mut [Word],
+    omega: &Slice,
+    tables: &Tables<P::Field>,
+    product: &mut Slice,
+    half: usize,
+) {
+    let bits = P::M;
+    let groups = out.len() / bits;
+    let keep = lane_run_mask(half);
+
+    for group in 0..groups {
+        let word = load(out, group, bits);
+        let mut low = [0; MAX_BITS];
+        let mut high = [0; MAX_BITS];
+        for i in 0..bits {
+            low[i] = word[i] & keep;
+            high[i] = (word[i] >> half) & keep;
+        }
+
+        tables.mul(product, &high, omega);
+        let mut merged = [0; MAX_BITS];
+        for i in 0..bits {
+            let new_low = low[i] ^ product[i];
+            let new_high = new_low ^ high[i];
+            merged[i] = new_low | (new_high << half);
+        }
+
+        store(out, group, bits, &merged);
+    }
+}
+
+/// One narrow level of the transposed transform; the mirror of [`narrow_forward_level`].
+#[cfg(feature = "decapsulate")]
+#[inline(always)]
+fn narrow_transpose_level<P: Params>(
+    work: &mut [Word],
+    omega: &Slice,
+    tables: &Tables<P::Field>,
+    product: &mut Slice,
+    half: usize,
+) {
+    let bits = P::M;
+    let groups = work.len() / bits;
+    let keep = lane_run_mask(half);
+
+    for group in 0..groups {
+        let word = load(work, group, bits);
+        let mut low = [0; MAX_BITS];
+        let mut high = [0; MAX_BITS];
+        for i in 0..bits {
+            low[i] = word[i] & keep;
+            high[i] = (word[i] >> half) & keep;
+        }
+
+        let mut sum = [0; MAX_BITS];
+        for i in 0..bits {
+            sum[i] = low[i] ^ high[i];
+        }
+        tables.mul(product, &sum, omega);
+
+        let mut merged = [0; MAX_BITS];
+        for i in 0..bits {
+            let new_high = high[i] ^ product[i];
+            merged[i] = sum[i] | (new_high << half);
+        }
+
+        store(work, group, bits, &merged);
+    }
 }
 
 /// A mask selecting the low `run` lanes of every `2 * run` lane block.
