@@ -476,6 +476,34 @@ small_stride_chain_x86! {
     0b1100_1100, 0b0011_0011
 }
 
+/// One vector of the contiguous stage at stride one or two: each `2p` block's halves compare
+/// in place, with an in-register swap standing in for the second stream.
+///
+/// `SWAP` permutes each 128-bit half so every lane faces its partner; `KEEP_MAX` selects
+/// which lanes keep the maximum. Both strides divide the vector width, so whole blocks are
+/// always covered.
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn minmax_adjacent_x86<const SWAP: i32, const KEEP_MAX: i32>(values: *mut i32) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_blend_epi32, _mm256_loadu_si256, _mm256_max_epi32, _mm256_min_epi32,
+        _mm256_shuffle_epi32, _mm256_storeu_si256,
+    };
+
+    // SAFETY: the caller provides eight writable elements and a CPU with `avx2`. Loads and
+    // stores are the unaligned forms, so no alignment precondition applies.
+    unsafe {
+        let v = _mm256_loadu_si256(values as *const __m256i);
+        let swapped = _mm256_shuffle_epi32::<SWAP>(v);
+        let lo = _mm256_min_epi32(v, swapped);
+        let hi = _mm256_max_epi32(v, swapped);
+        _mm256_storeu_si256(
+            values as *mut __m256i,
+            _mm256_blend_epi32::<KEEP_MAX>(lo, hi),
+        );
+    }
+}
+
 /// The x86 vector form of the power-of-two sorter.
 ///
 /// The body is the portable sorter with the comparator width lifted to a cascade of vector
@@ -499,29 +527,65 @@ macro_rules! sort_packed_i32_pow2_x86 {
             let top = n >> 1;
             let mut p = top;
             while p > 0 {
-                let mut base = 0;
-                while base < n {
-                    let (left, right) = x[base..base + 2 * p].split_at_mut(p);
-                    // `p` and the widths are powers of two, so exactly one cascade level runs
-                    // and it covers `p` whole; the scalar loop below covers `p < 4`.
+                if p <= 2 {
+                    // At strides one and two, whole `2p` blocks fit inside one vector, so
+                    // the stage runs as an in-register swap-compare-blend per eight lanes;
+                    // the scalar loop covers inputs shorter than a vector.
                     let mut k = 0;
-                    $(
-                        while k + $width <= p {
-                            // SAFETY: `left` and `right` are disjoint `p`-element slices and
-                            // `k + $width <= p`, so both regions are in bounds. The detected
-                            // level's target features cover the comparator's.
-                            unsafe {
-                                $minmax_vec(left.as_mut_ptr().add(k), right.as_mut_ptr().add(k));
+                    while k + 8 <= n {
+                        // SAFETY: `k + 8 <= n` keeps the eight elements in bounds and the
+                        // dispatched level guarantees `avx2`.
+                        unsafe {
+                            if p == 1 {
+                                minmax_adjacent_x86::<0b10_11_00_01, 0b1010_1010>(
+                                    x.as_mut_ptr().add(k),
+                                );
+                            } else {
+                                minmax_adjacent_x86::<0b01_00_11_10, 0b1100_1100>(
+                                    x.as_mut_ptr().add(k),
+                                );
                             }
-                            k += $width;
                         }
-                    )+
-                    for (a, b) in left[k..].iter_mut().zip(right[k..].iter_mut()) {
-                        let (lo, hi) = minmax_packed_i32(*a, *b);
-                        *a = lo;
-                        *b = hi;
+                        k += 8;
                     }
-                    base += 2 * p;
+                    while k < n {
+                        let (left, right) = x[k..k + 2 * p].split_at_mut(p);
+                        for (a, b) in left.iter_mut().zip(right.iter_mut()) {
+                            let (lo, hi) = minmax_packed_i32(*a, *b);
+                            *a = lo;
+                            *b = hi;
+                        }
+                        k += 2 * p;
+                    }
+                } else {
+                    let mut base = 0;
+                    while base < n {
+                        let (left, right) = x[base..base + 2 * p].split_at_mut(p);
+                        // `p` and the widths are powers of two, so exactly one cascade
+                        // level runs and it covers `p` whole.
+                        let mut k = 0;
+                        $(
+                            while k + $width <= p {
+                                // SAFETY: `left` and `right` are disjoint `p`-element
+                                // slices and `k + $width <= p`, so both regions are in
+                                // bounds. The detected level's target features cover the
+                                // comparator's.
+                                unsafe {
+                                    $minmax_vec(
+                                        left.as_mut_ptr().add(k),
+                                        right.as_mut_ptr().add(k),
+                                    );
+                                }
+                                k += $width;
+                            }
+                        )+
+                        for (a, b) in left[k..].iter_mut().zip(right[k..].iter_mut()) {
+                            let (lo, hi) = minmax_packed_i32(*a, *b);
+                            *a = lo;
+                            *b = hi;
+                        }
+                        base += 2 * p;
+                    }
                 }
 
                 let mut index = 0;
