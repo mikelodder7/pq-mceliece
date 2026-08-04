@@ -298,19 +298,51 @@ fn mat_gen<P: Params>(
         return false;
     }
 
+    // Row `i * m + k` of the matrix is bit-plane `k` of `alpha_j^i / g(alpha_j)`, so building
+    // the powers bit-sliced makes every row a straight copy of plane words and turns the
+    // per-element Horner step into one bit-sliced multiply per group of lanes. Lanes past
+    // `n` stay zero through every multiply, which keeps the rows' tail bits zero exactly as
+    // the byte-at-a-time build left them.
     let mut mat = BitMatrix::zeros(P::PK_NROWS, P::N);
+    let planes = P::M;
+    let groups = P::N.div_ceil(LANES);
+    let mut inv_sliced: Zeroizing<Vec<Word>> = Zeroizing::new(vec![0; groups * planes]);
+    let mut support_sliced: Zeroizing<Vec<Word>> = Zeroizing::new(vec![0; groups * planes]);
+    for (j, (&value, &alpha)) in inv.iter().zip(support.iter()).enumerate() {
+        let group = j / LANES;
+        let lane = j % LANES;
+        for plane in 0..planes {
+            inv_sliced[group * planes + plane] |= Word::from((value >> plane) & 1) << lane;
+            support_sliced[group * planes + plane] |= Word::from((alpha >> plane) & 1) << lane;
+        }
+    }
+
+    let tables = Tables::<P::Field>::new();
+    let read = |src: &[Word], group: usize| -> Slice {
+        let mut value: Slice = [0; MAX_BITS];
+        value[..planes].copy_from_slice(&src[group * planes..group * planes + planes]);
+        value
+    };
+    // Rows carry one padding word past the columns; it stays zero, so only the data words
+    // are written.
+    let data_words = P::N.div_ceil(64);
     for i in 0..P::T {
-        for j in (0..P::N).step_by(8) {
-            for k in 0..P::M {
-                let mut b = 0u8;
-                for offset in (0..8).rev() {
-                    b = (b << 1) | (((inv[j + offset] >> k) & 1) as u8);
-                }
-                mat.set_byte(i * P::M + k, j / 8, b);
+        for k in 0..planes {
+            let row = mat.row_words_mut(i * planes + k);
+            for (word, slot) in row[..data_words].iter_mut().enumerate() {
+                let plane = inv_sliced[(word / 2) * planes + k];
+                *slot = (plane >> (64 * (word % 2))) as u64;
             }
         }
-        for (slot, &a) in inv.iter_mut().zip(support.iter()) {
-            *slot = P::Field::mul(*slot, a);
+        if i + 1 == P::T {
+            break;
+        }
+        let mut product: Slice = [0; MAX_BITS];
+        for group in 0..groups {
+            let current = read(&inv_sliced, group);
+            let alpha = read(&support_sliced, group);
+            tables.mul(&mut product, &current, &alpha);
+            inv_sliced[group * planes..group * planes + planes].copy_from_slice(&product[..planes]);
         }
     }
 

@@ -944,6 +944,12 @@ impl BitMatrix {
         self.data[word] = (self.data[word] & !(0xFFu64 << shift)) | ((value as u64) << shift);
     }
 
+    /// The words of row `row`, for callers that assemble whole rows at once.
+    #[inline]
+    pub(crate) fn row_words_mut(&mut self, row: usize) -> &mut [u64] {
+        &mut self.data[row * self.stride..(row + 1) * self.stride]
+    }
+
     /// Read bit `bit` of `row` as 0 or 1.
     #[inline]
     pub(crate) fn bit(&self, row: usize, bit: usize) -> u64 {
