@@ -1421,7 +1421,26 @@ impl BitMatrix {
         let (before, rest) = self.data.split_at_mut(trailing_start);
         let block = &before[block_start..block_start + COUNT * stride];
 
-        for target in rest.chunks_exact_mut(stride) {
+        let mut pairs = rest.chunks_exact_mut(2 * stride);
+        for pair in pairs.by_ref() {
+            let mut conditions = [[0u64; 16]; 2];
+            let mut conditions_high = [[0u64; 16]; 2];
+            for ((low, high), row) in conditions
+                .iter_mut()
+                .zip(conditions_high.iter_mut())
+                .zip(pair.chunks_exact(stride))
+            {
+                let bits = (row[word] >> shift) & panel_mask;
+                for (offset, condition) in low.iter_mut().enumerate() {
+                    *condition = (bits >> offset) & 1;
+                }
+                for (offset, condition) in high.iter_mut().enumerate() {
+                    *condition = (bits >> (offset + 16)) & 1;
+                }
+            }
+            apply_panel_pair::<COUNT>(pair, block, stride, first, &conditions, &conditions_high);
+        }
+        for target in pairs.into_remainder().chunks_exact_mut(stride) {
             let bits = (target[word] >> shift) & panel_mask;
             let mut conditions = [0u64; 16];
             let mut conditions_high = [0u64; 16];
@@ -1506,6 +1525,47 @@ fn apply_panel<const COUNT: usize>(
         };
         xor_row_if(&mut target[first..], &source[first..], condition);
     }
+}
+
+/// The pair form of [`apply_panel`]: two consecutive trailing rows advance through one pass
+/// of the panel's source chunks, halving the source traffic that bounds the fold.
+#[inline]
+fn apply_panel_pair<const COUNT: usize>(
+    targets: &mut [u64],
+    block: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: &[[u64; 16]; 2],
+    conditions_high: &[[u64; 16]; 2],
+) {
+    if COUNT == 16 {
+        xor_sixteen_sources_pair(targets, block, stride, first, conditions);
+        return;
+    }
+    if COUNT == 32 {
+        let (low, high) = block.split_at(16 * stride);
+        xor_sixteen_sources_pair(targets, low, stride, first, conditions);
+        xor_sixteen_sources_pair(targets, high, stride, first, conditions_high);
+        return;
+    }
+
+    let (first_row, second_row) = targets.split_at_mut(stride);
+    apply_panel::<COUNT>(
+        first_row,
+        block,
+        stride,
+        first,
+        &conditions[0],
+        &conditions_high[0],
+    );
+    apply_panel::<COUNT>(
+        second_row,
+        block,
+        stride,
+        first,
+        &conditions[1],
+        &conditions_high[1],
+    );
 }
 
 impl Drop for BitMatrix {
