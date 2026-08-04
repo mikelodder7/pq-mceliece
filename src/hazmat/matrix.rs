@@ -237,6 +237,34 @@ fn xor_sixteen_sources(
     xor_sources_portable::<16>(destination, sources, stride, first, conditions);
 }
 
+/// XOR sixteen masked source rows into each of two consecutive destination rows.
+///
+/// On x86 the pair form loads every source chunk once for both destinations; elsewhere it is
+/// exactly two single-destination passes, in row order.
+#[inline(always)]
+fn xor_sixteen_sources_pair(
+    destinations: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: &[[u64; 16]; 2],
+) {
+    #[cfg(target_arch = "x86_64")]
+    super::simd::matrix_x86::xor_sources_pair_if::<16>(
+        destinations,
+        sources,
+        stride,
+        first,
+        conditions,
+    );
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let (first_row, second_row) = destinations.split_at_mut(stride);
+        xor_sixteen_sources(first_row, sources, stride, first, &conditions[0]);
+        xor_sixteen_sources(second_row, sources, stride, first, &conditions[1]);
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 macro_rules! compact_xor_row_pair {
     ($mask:literal) => {
@@ -1049,7 +1077,19 @@ impl BitMatrix {
         let block = &block_and_after[..count * stride];
 
         if count == 16 {
-            for target in before.chunks_exact_mut(stride) {
+            let mut pairs = before.chunks_exact_mut(2 * stride);
+            for pair in pairs.by_ref() {
+                let mut conditions = [[0u64; 16]; 2];
+                for (side, side_conditions) in conditions.iter_mut().enumerate() {
+                    let row = &pair[side * stride..(side + 1) * stride];
+                    for (offset, condition) in side_conditions.iter_mut().enumerate() {
+                        let pivot = start + offset;
+                        *condition = (row[pivot / 64] >> (pivot % 64)) & 1;
+                    }
+                }
+                xor_sixteen_sources_pair(pair, block, stride, first, &conditions);
+            }
+            for target in pairs.into_remainder().chunks_exact_mut(stride) {
                 let mut conditions = [0u64; 16];
                 for (offset, condition) in conditions.iter_mut().enumerate() {
                     let pivot = start + offset;

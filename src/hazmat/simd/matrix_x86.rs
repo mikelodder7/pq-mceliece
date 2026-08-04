@@ -436,6 +436,192 @@ pub(crate) fn xor_sources_if<const N: usize>(
     }
 }
 
+#[target_feature(enable = "avx512f")]
+unsafe fn xor_sources_pair_avx512<const N: usize>(
+    destinations: [*mut u64; 2],
+    sources: *const u64,
+    stride: usize,
+    len: usize,
+    masks: &[[u64; N]; 2],
+) {
+    use core::arch::x86_64::{
+        _mm512_loadu_epi64, _mm512_set1_epi64, _mm512_storeu_epi64, _mm512_ternarylogic_epi64,
+        _mm512_xor_si512,
+    };
+
+    // SAFETY: the caller guarantees two disjoint destination rows and `N` disjoint source
+    // rows, each of `stride` words with `len` valid from the given offset.
+    unsafe {
+        let mut broadcasts = [[_mm512_set1_epi64(0); N]; 2];
+        for (side, masks) in broadcasts.iter_mut().zip(masks.iter()) {
+            for (slot, &mask) in side.iter_mut().zip(masks.iter()) {
+                *slot = _mm512_set1_epi64(mask as i64);
+            }
+        }
+
+        let mut i = 0;
+        while i + AVX512_LANES <= len {
+            // Each source chunk is loaded once and folded into both destinations, which
+            // halves the source traffic of two single-destination passes. Both folds keep
+            // the even/odd accumulator split of the single-destination kernel.
+            let mut even0 = _mm512_loadu_epi64(destinations[0].add(i) as *const i64);
+            let mut even1 = _mm512_loadu_epi64(destinations[1].add(i) as *const i64);
+            let mut odd0 = _mm512_set1_epi64(0);
+            let mut odd1 = _mm512_set1_epi64(0);
+            for row in 0..N / 2 {
+                let s0 = _mm512_loadu_epi64(sources.add(2 * row * stride + i) as *const i64);
+                let s1 = _mm512_loadu_epi64(sources.add((2 * row + 1) * stride + i) as *const i64);
+                even0 = _mm512_ternarylogic_epi64::<0x78>(even0, s0, broadcasts[0][2 * row]);
+                even1 = _mm512_ternarylogic_epi64::<0x78>(even1, s0, broadcasts[1][2 * row]);
+                odd0 = _mm512_ternarylogic_epi64::<0x78>(odd0, s1, broadcasts[0][2 * row + 1]);
+                odd1 = _mm512_ternarylogic_epi64::<0x78>(odd1, s1, broadcasts[1][2 * row + 1]);
+            }
+            if N % 2 == 1 {
+                let s = _mm512_loadu_epi64(sources.add((N - 1) * stride + i) as *const i64);
+                even0 = _mm512_ternarylogic_epi64::<0x78>(even0, s, broadcasts[0][N - 1]);
+                even1 = _mm512_ternarylogic_epi64::<0x78>(even1, s, broadcasts[1][N - 1]);
+            }
+            _mm512_storeu_epi64(
+                destinations[0].add(i) as *mut i64,
+                _mm512_xor_si512(even0, odd0),
+            );
+            _mm512_storeu_epi64(
+                destinations[1].add(i) as *mut i64,
+                _mm512_xor_si512(even1, odd1),
+            );
+            i += AVX512_LANES;
+        }
+        while i < len {
+            for (destination, masks) in destinations.iter().zip(masks.iter()) {
+                let mut acc = *destination.add(i);
+                for (row, &mask) in masks.iter().enumerate() {
+                    acc ^= *sources.add(row * stride + i) & mask;
+                }
+                *destination.add(i) = acc;
+            }
+            i += 1;
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn xor_sources_pair_avx2<const N: usize>(
+    destinations: [*mut u64; 2],
+    sources: *const u64,
+    stride: usize,
+    len: usize,
+    masks: &[[u64; N]; 2],
+) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_loadu_si256, _mm256_set1_epi64x, _mm256_setzero_si256,
+        _mm256_storeu_si256, _mm256_xor_si256,
+    };
+
+    // SAFETY: same contract as the 512-bit kernel above.
+    unsafe {
+        let mut broadcasts = [[_mm256_setzero_si256(); N]; 2];
+        for (side, masks) in broadcasts.iter_mut().zip(masks.iter()) {
+            for (slot, &mask) in side.iter_mut().zip(masks.iter()) {
+                *slot = _mm256_set1_epi64x(mask as i64);
+            }
+        }
+
+        let mut i = 0;
+        while i + AVX2_LANES <= len {
+            let mut even0 = _mm256_loadu_si256(destinations[0].add(i) as *const __m256i);
+            let mut even1 = _mm256_loadu_si256(destinations[1].add(i) as *const __m256i);
+            let mut odd0 = _mm256_setzero_si256();
+            let mut odd1 = _mm256_setzero_si256();
+            for row in 0..N / 2 {
+                let s0 = _mm256_loadu_si256(sources.add(2 * row * stride + i) as *const __m256i);
+                let s1 =
+                    _mm256_loadu_si256(sources.add((2 * row + 1) * stride + i) as *const __m256i);
+                even0 = _mm256_xor_si256(even0, _mm256_and_si256(s0, broadcasts[0][2 * row]));
+                even1 = _mm256_xor_si256(even1, _mm256_and_si256(s0, broadcasts[1][2 * row]));
+                odd0 = _mm256_xor_si256(odd0, _mm256_and_si256(s1, broadcasts[0][2 * row + 1]));
+                odd1 = _mm256_xor_si256(odd1, _mm256_and_si256(s1, broadcasts[1][2 * row + 1]));
+            }
+            if N % 2 == 1 {
+                let s = _mm256_loadu_si256(sources.add((N - 1) * stride + i) as *const __m256i);
+                even0 = _mm256_xor_si256(even0, _mm256_and_si256(s, broadcasts[0][N - 1]));
+                even1 = _mm256_xor_si256(even1, _mm256_and_si256(s, broadcasts[1][N - 1]));
+            }
+            _mm256_storeu_si256(
+                destinations[0].add(i) as *mut __m256i,
+                _mm256_xor_si256(even0, odd0),
+            );
+            _mm256_storeu_si256(
+                destinations[1].add(i) as *mut __m256i,
+                _mm256_xor_si256(even1, odd1),
+            );
+            i += AVX2_LANES;
+        }
+        while i < len {
+            for (destination, masks) in destinations.iter().zip(masks.iter()) {
+                let mut acc = *destination.add(i);
+                for (row, &mask) in masks.iter().enumerate() {
+                    acc ^= *sources.add(row * stride + i) & mask;
+                }
+                *destination.add(i) = acc;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// XOR `N` masked source rows into each of two destination rows, one source pass for both.
+///
+/// `destinations` holds two complete, consecutive rows of `stride` words; `sources` holds `N`
+/// disjoint rows of the same width. Only words `first..stride` are touched. Loading each
+/// source chunk once for both destinations is the point: the single-destination fold is
+/// bound by source traffic, not by its arithmetic.
+#[inline(never)]
+pub(crate) fn xor_sources_pair_if<const N: usize>(
+    destinations: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: &[[u64; N]; 2],
+) {
+    debug_assert_eq!(destinations.len(), 2 * stride);
+    debug_assert_eq!(sources.len(), N * stride);
+    debug_assert!(first <= stride);
+
+    let masks = [masks_of(&conditions[0]), masks_of(&conditions[1])];
+    let len = stride - first;
+    if len == 0 {
+        return;
+    }
+
+    // SAFETY: `destinations` is exactly `2 * stride` words, so both rows cover
+    // `first + len == stride` valid words; `sources` rows likewise. The destination and
+    // source slices come from disjoint borrows, and the detected level guarantees the
+    // target features.
+    unsafe {
+        let (first_row, second_row) = destinations.split_at_mut(stride);
+        let dst = [
+            first_row.as_mut_ptr().add(first),
+            second_row.as_mut_ptr().add(first),
+        ];
+        let src = sources.as_ptr().add(first);
+        match level() {
+            Level::Avx512 => xor_sources_pair_avx512::<N>(dst, src, stride, len, &masks),
+            Level::Avx2 => xor_sources_pair_avx2::<N>(dst, src, stride, len, &masks),
+            Level::Scalar => {
+                for (destination, masks) in dst.iter().zip(masks.iter()) {
+                    for i in 0..len {
+                        let mut acc = *destination.add(i);
+                        for (row, &mask) in masks.iter().enumerate() {
+                            acc ^= *src.add(row * stride + i) & mask;
+                        }
+                        *destination.add(i) = acc;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -571,6 +757,35 @@ mod tests {
 
                 let mut actual = original;
                 xor_sources_if::<16>(&mut actual, &sources, stride, first, &conditions);
+
+                assert_eq!(actual, expected, "stride {stride} first {first}");
+            }
+        }
+    }
+
+    #[test]
+    fn sixteen_sources_into_a_pair_match_two_single_passes() {
+        let mut rng = Rng(0xA511_57DE_7726_0F4B);
+        for stride in STRIDES {
+            for first in [0, stride / 2, stride] {
+                let sources: Vec<u64> = (0..16 * stride).map(|_| rng.next()).collect();
+                let original: Vec<u64> = (0..2 * stride).map(|_| rng.next()).collect();
+                let mut conditions = [[0u64; 16]; 2];
+                for side in conditions.iter_mut() {
+                    for slot in side.iter_mut() {
+                        *slot = rng.next() & 1;
+                    }
+                }
+
+                let mut expected = original.clone();
+                {
+                    let (first_row, second_row) = expected.split_at_mut(stride);
+                    xor_sources_if::<16>(first_row, &sources, stride, first, &conditions[0]);
+                    xor_sources_if::<16>(second_row, &sources, stride, first, &conditions[1]);
+                }
+
+                let mut actual = original;
+                xor_sources_pair_if::<16>(&mut actual, &sources, stride, first, &conditions);
 
                 assert_eq!(actual, expected, "stride {stride} first {first}");
             }
