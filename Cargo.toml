@@ -104,7 +104,7 @@ hybrid-array = { version = "0.4.13", features = ["extra-sizes"], optional = true
 kem = { version = "0.3", optional = true }
 rand_core = { version = "0.10", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
-shake = "0.1"
+shake = { features = ["zeroize"], version = "0.1" }
 thiserror = "2.0"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
