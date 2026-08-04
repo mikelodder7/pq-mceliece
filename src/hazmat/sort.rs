@@ -65,6 +65,46 @@ unsafe fn minmax_packed_i32x4(left: *mut i32, right: *mut i32) {
     }
 }
 
+/// The x86 counterparts of the NEON comparator. `pminsd`/`pmaxsd` need SSE4.1 at minimum, which
+/// is above the `x86_64` baseline, so unlike AArch64 these cannot be reached at compile time;
+/// the sorter picks a whole-network kernel from [`super::simd::level`] at runtime instead.
+/// The network keeps both widths in a cascade: the small strides carry the most chain levels,
+/// so a network that let `p = 4` fall to scalar code measured slower on the whole key
+/// generation, not faster.
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn minmax_packed_i32x4_x86(left: *mut i32, right: *mut i32) {
+    use core::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_max_epi32, _mm_min_epi32, _mm_storeu_si128,
+    };
+
+    // SAFETY: the caller provides two disjoint, writable four-element regions and a CPU with
+    // `sse4.1`. Loads and stores are the unaligned forms, so no alignment precondition applies.
+    unsafe {
+        let a = _mm_loadu_si128(left as *const __m128i);
+        let b = _mm_loadu_si128(right as *const __m128i);
+        _mm_storeu_si128(left as *mut __m128i, _mm_min_epi32(a, b));
+        _mm_storeu_si128(right as *mut __m128i, _mm_max_epi32(a, b));
+    }
+}
+
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn minmax_packed_i32x8(left: *mut i32, right: *mut i32) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_max_epi32, _mm256_min_epi32, _mm256_storeu_si256,
+    };
+
+    // SAFETY: the caller provides two disjoint, writable eight-element regions and a CPU with
+    // `avx2`. Loads and stores are the unaligned forms, so no alignment precondition applies.
+    unsafe {
+        let a = _mm256_loadu_si256(left as *const __m256i);
+        let b = _mm256_loadu_si256(right as *const __m256i);
+        _mm256_storeu_si256(left as *mut __m256i, _mm256_min_epi32(a, b));
+        _mm256_storeu_si256(right as *mut __m256i, _mm256_max_epi32(a, b));
+    }
+}
+
 #[cfg(feature = "keygen")]
 macro_rules! batch_minmax_packed_i32 {
     ($left:expr, $right:expr) => {{
@@ -225,6 +265,25 @@ sorter! {
 /// generic sorter without changing its compare-exchange schedule.
 #[cfg(feature = "keygen")]
 pub(crate) fn sort_packed_i32_power_of_two(x: &mut [i32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use super::simd::{Level, level};
+        // Both vector tiers run the eight-lane network: a sixteen-lane AVX-512 form measured
+        // 1.9% slower for whole key generation on Zen 5, where the 512-bit datapath is
+        // double-pumped and the sixty-four-byte windows split cache lines.
+        if level() >= Level::Avx2 {
+            // SAFETY: the level was detected from CPUID, so the target features the kernel
+            // names are present.
+            return unsafe { sort_packed_i32_pow2_avx2(x) };
+        }
+    }
+    sort_packed_i32_power_of_two_portable(x)
+}
+
+/// The compile-time-dispatched form of [`sort_packed_i32_power_of_two`]: NEON comparators on
+/// AArch64, the arithmetic-mask idiom everywhere else.
+#[cfg(feature = "keygen")]
+fn sort_packed_i32_power_of_two_portable(x: &mut [i32]) {
     let n = x.len();
     debug_assert!(n.is_power_of_two());
     if n < 2 {
@@ -316,6 +375,128 @@ pub(crate) fn sort_packed_i32_power_of_two(x: &mut [i32]) {
         }
         p >>= 1;
     }
+}
+
+/// The x86 vector form of the power-of-two sorter.
+///
+/// The body is the portable sorter with the comparator width lifted to a cascade of vector
+/// widths: each stage runs the widest comparator its stride admits, so `p >= W` strides
+/// advance a whole top-width vector of chains per step and the smaller strides — which carry
+/// the most chain levels — still run their own vector widths instead of falling to scalar
+/// code. The compare-exchange schedule is identical at every width; only the grouping of
+/// independent comparisons changes.
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+macro_rules! sort_packed_i32_pow2_x86 {
+    ($(#[$meta:meta])* $name:ident, $feature:literal, $(($width:expr, $minmax_vec:ident)),+) => {
+        $(#[$meta])*
+        #[target_feature(enable = $feature)]
+        unsafe fn $name(x: &mut [i32]) {
+            let n = x.len();
+            debug_assert!(n.is_power_of_two());
+            if n < 2 {
+                return;
+            }
+
+            let top = n >> 1;
+            let mut p = top;
+            while p > 0 {
+                let mut base = 0;
+                while base < n {
+                    let (left, right) = x[base..base + 2 * p].split_at_mut(p);
+                    // `p` and the widths are powers of two, so exactly one cascade level runs
+                    // and it covers `p` whole; the scalar loop below covers `p < 4`.
+                    let mut k = 0;
+                    $(
+                        while k + $width <= p {
+                            // SAFETY: `left` and `right` are disjoint `p`-element slices and
+                            // `k + $width <= p`, so both regions are in bounds. The detected
+                            // level's target features cover the comparator's.
+                            unsafe {
+                                $minmax_vec(left.as_mut_ptr().add(k), right.as_mut_ptr().add(k));
+                            }
+                            k += $width;
+                        }
+                    )+
+                    for (a, b) in left[k..].iter_mut().zip(right[k..].iter_mut()) {
+                        let (lo, hi) = minmax_packed_i32(*a, *b);
+                        *a = lo;
+                        *b = hi;
+                    }
+                    base += 2 * p;
+                }
+
+                let mut index = 0;
+                let mut q = top;
+                while q > p {
+                    let limit = n - q;
+                    while index < limit {
+                        let block_end = (index | (p - 1)) + 1;
+                        if index & p != 0 {
+                            index = block_end;
+                            continue;
+                        }
+
+                        let mut offset = 0;
+                        $(
+                            while offset + $width <= p {
+                                let i = index + offset;
+                                let mut carry = [0i32; $width];
+                                carry.copy_from_slice(&x[i + p..i + p + $width]);
+
+                                let mut r = q;
+                                while r > p {
+                                    // SAFETY: `n`, `q`, `p` are powers of two with `2p <= q`,
+                                    // so `n - q` is a multiple of `2p` and the largest run
+                                    // start with bit `p` clear below `limit = n - q` is
+                                    // `n - q - 2p`. With `offset <= p - $width` and `r <= q`
+                                    // the window ends at `i + r + $width <= n - p`. The
+                                    // compiler cannot see this, and the range check it
+                                    // otherwise emits costs a third of the loop.
+                                    let window =
+                                        unsafe { x.get_unchecked_mut(i + r..i + r + $width) };
+                                    // SAFETY: `carry` and `window` are disjoint
+                                    // `$width`-element regions and the detected level's
+                                    // target features cover the comparator's.
+                                    unsafe {
+                                        $minmax_vec(carry.as_mut_ptr(), window.as_mut_ptr());
+                                    }
+                                    r >>= 1;
+                                }
+
+                                x[i + p..i + p + $width].copy_from_slice(&carry);
+                                offset += $width;
+                            }
+                        )+
+
+                        for i in index + offset..block_end {
+                            let chain = &mut x[i..=i + q];
+                            let mut a = chain[p];
+                            let mut r = q;
+                            while r > p {
+                                let (lo, hi) = minmax_packed_i32(a, chain[r]);
+                                a = lo;
+                                chain[r] = hi;
+                                r >>= 1;
+                            }
+                            chain[p] = a;
+                        }
+
+                        index = block_end;
+                    }
+                    q >>= 1;
+                }
+                p >>= 1;
+            }
+        }
+    };
+}
+
+#[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+sort_packed_i32_pow2_x86! {
+    /// The AVX2 form of [`sort_packed_i32_power_of_two`]: eight chains per step, four for the
+    /// `p = 4` stride. `avx2` transitively enables the cascade's `sse4.1`.
+    sort_packed_i32_pow2_avx2, "avx2",
+    (8, minmax_packed_i32x8), (4, minmax_packed_i32x4_x86)
 }
 
 sorter! {
@@ -460,6 +641,29 @@ mod tests {
             let mut expected = values;
             sort_packed_i32(&mut expected);
             assert_eq!(actual, expected, "power {power}");
+        }
+    }
+
+    /// The vector network is called directly, not through
+    /// [`level`](super::super::simd::level), so it is exercised even where detection would
+    /// pick another path.
+    #[test]
+    #[cfg(all(feature = "keygen", target_arch = "x86_64"))]
+    fn x86_tier_sorts_match_the_portable_sort() {
+        let mut rng = Rng(0x8000_0000_B21D_C581);
+        for power in 0..=13 {
+            let values: Vec<i32> = (0..1usize << power)
+                .map(|_| (rng.next() as i32) & 0x3fff_ffff)
+                .collect();
+            let mut expected = values.clone();
+            sort_packed_i32_power_of_two_portable(&mut expected);
+
+            if is_x86_feature_detected!("avx2") {
+                let mut actual = values.clone();
+                // SAFETY: the detected feature covers the kernel's requirement.
+                unsafe { sort_packed_i32_pow2_avx2(&mut actual) };
+                assert_eq!(actual, expected, "avx2 power {power}");
+            }
         }
     }
 }
