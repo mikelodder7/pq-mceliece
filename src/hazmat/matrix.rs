@@ -937,6 +937,10 @@ impl BitMatrix {
     }
 
     /// Store `value` as byte `index` of `row`.
+    ///
+    /// The library builds rows from bit-sliced planes; only the tests still assemble
+    /// matrices byte by byte.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn set_byte(&mut self, row: usize, index: usize, value: u8) {
         let word = row * self.stride + index / 8;

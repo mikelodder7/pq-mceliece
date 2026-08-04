@@ -48,7 +48,7 @@ fn same_mask(x: u16, y: u16) -> u64 {
 /// Montgomery's trick reduces one bit-sliced inversion per group to one inversion total plus
 /// three multiplications per group. The output remains bit-sliced so the arithmetic and its
 /// memory access pattern are independent of the polynomial.
-fn inverse_evaluations<P: Params>(out: &mut [Word], goppa: &[u16]) {
+fn inverse_evaluations<P: Params>(out: &mut [Word], goppa: &[u16], tables: &Tables<P::Field>) {
     debug_assert_eq!(out.len(), sliced_words::<P>());
     debug_assert_eq!(goppa.len(), P::T);
 
@@ -56,9 +56,8 @@ fn inverse_evaluations<P: Params>(out: &mut [Word], goppa: &[u16]) {
     monic[..P::T].copy_from_slice(goppa);
     monic[P::T] = 1;
 
-    let tables = Tables::<P::Field>::new();
     let mut workspace = TransformWorkspace::new::<P>();
-    eval_all_bitrev_sliced::<P>(out, &monic, &tables, &mut workspace);
+    eval_all_bitrev_sliced::<P>(out, &monic, tables, &mut workspace);
 
     let planes = P::M;
     let groups = P::Q / LANES;
@@ -94,6 +93,65 @@ fn inverse_evaluations<P: Params>(out: &mut [Word], goppa: &[u16]) {
         acc = next;
     }
     out[..planes].copy_from_slice(&acc[..planes]);
+}
+
+/// Write the parity-check rows for every power of the support: row `i * m + k` of `mat` is
+/// bit-plane `k` of `values_j * alphas_j^i` across the columns.
+///
+/// Row `i * m + k` of the matrix IS bit-plane `k` of the power, so slicing the inputs once
+/// makes every row a straight copy of plane words and turns each Horner step into one
+/// bit-sliced multiply per group of lanes — the same kernels the inverse evaluations were
+/// produced with. Lanes past the columns stay zero through every multiply, and the rows'
+/// padding word is never written, so the rows match the byte-at-a-time build exactly. The
+/// final power's multiply would feed nothing and is skipped.
+fn build_power_rows<P: Params>(
+    mat: &mut BitMatrix,
+    values: &[u16],
+    alphas: &[u16],
+    tables: &Tables<P::Field>,
+) {
+    let planes = P::M;
+    let columns = values.len();
+    debug_assert_eq!(alphas.len(), columns);
+    let groups = columns.div_ceil(LANES);
+    let data_words = columns.div_ceil(64);
+
+    let mut values_sliced: Zeroizing<Vec<Word>> = Zeroizing::new(vec![0; groups * planes]);
+    let mut alphas_sliced: Zeroizing<Vec<Word>> = Zeroizing::new(vec![0; groups * planes]);
+    for (j, (&value, &alpha)) in values.iter().zip(alphas.iter()).enumerate() {
+        let group = j / LANES;
+        let lane = j % LANES;
+        for plane in 0..planes {
+            values_sliced[group * planes + plane] |= Word::from((value >> plane) & 1) << lane;
+            alphas_sliced[group * planes + plane] |= Word::from((alpha >> plane) & 1) << lane;
+        }
+    }
+
+    let read = |src: &[Word], group: usize| -> Slice {
+        let mut value: Slice = [0; MAX_BITS];
+        value[..planes].copy_from_slice(&src[group * planes..group * planes + planes]);
+        value
+    };
+    for i in 0..P::T {
+        for k in 0..planes {
+            let row = mat.row_words_mut(i * planes + k);
+            for (word, slot) in row[..data_words].iter_mut().enumerate() {
+                let plane = values_sliced[(word / 2) * planes + k];
+                *slot = (plane >> (64 * (word % 2))) as u64;
+            }
+        }
+        if i + 1 == P::T {
+            break;
+        }
+        let mut product: Slice = [0; MAX_BITS];
+        for group in 0..groups {
+            let current = read(&values_sliced, group);
+            let alpha = read(&alphas_sliced, group);
+            tables.mul(&mut product, &current, &alpha);
+            values_sliced[group * planes..group * planes + planes]
+                .copy_from_slice(&product[..planes]);
+        }
+    }
 }
 
 /// Bring the last `mu` pivots into place for a semi-systematic parameter set.
@@ -173,31 +231,22 @@ fn move_columns<P: Params>(mat: &mut BitMatrix, pi: &mut [i16], pivots: &mut u64
 /// whether it is invertible -- which is exactly whether the full-width sweep would succeed.
 ///
 /// The block build mirrors the full build below restricted to the first `mt` support
-/// positions, on a copy of the inverse evaluations so the caller's remain untouched. `mt` is
-/// not a multiple of eight for every parameter set, so the copy pads to a byte boundary with
-/// zeros; the padding columns sit past every pivot and influence nothing.
-fn square_block_is_invertible<P: Params>(inv: &[u16], support: &[u16]) -> bool {
+/// positions; [`build_power_rows`] slices its own copy, so the caller's inverses remain
+/// untouched.
+fn square_block_is_invertible<P: Params>(
+    inv: &[u16],
+    support: &[u16],
+    tables: &Tables<P::Field>,
+) -> bool {
     const PANEL: usize = 32;
 
-    let padded = P::PK_NROWS.div_ceil(8) * 8;
-    let mut block_inv = Zeroizing::new(vec![0u16; padded]);
-    block_inv[..P::PK_NROWS].copy_from_slice(&inv[..P::PK_NROWS]);
-
     let mut block = BitMatrix::zeros(P::PK_NROWS, P::PK_NROWS);
-    for i in 0..P::T {
-        for j in (0..padded).step_by(8) {
-            for k in 0..P::M {
-                let mut b = 0u8;
-                for offset in (0..8).rev() {
-                    b = (b << 1) | (((block_inv[j + offset] >> k) & 1) as u8);
-                }
-                block.set_byte(i * P::M + k, j / 8, b);
-            }
-        }
-        for (slot, &a) in block_inv.iter_mut().zip(support.iter()) {
-            *slot = P::Field::mul(*slot, a);
-        }
-    }
+    build_power_rows::<P>(
+        &mut block,
+        &inv[..P::PK_NROWS],
+        &support[..P::PK_NROWS],
+        tables,
+    );
 
     // The same forward sweep `mat_gen` runs, on the same schedule, minus the trailing block.
     let mut panelled = 0;
@@ -246,8 +295,9 @@ fn mat_gen<P: Params>(
     // corresponding `(a_i, i)` field-ordering entry. The permutation occupies the high bits,
     // so the same integer sorting network both orders the support and carries the inverse
     // evaluations into matching positions.
+    let tables = Tables::<P::Field>::new();
     let mut evaluations = Zeroizing::new(vec![0; sliced_words::<P>()]);
-    inverse_evaluations::<P>(&mut evaluations, goppa);
+    inverse_evaluations::<P>(&mut evaluations, goppa, &tables);
 
     let mut buf = Zeroizing::new(vec![0u64; P::Q]);
     for (i, slot) in buf.iter_mut().enumerate() {
@@ -294,57 +344,12 @@ fn mat_gen<P: Params>(
     // full sweep's outcome. Screen on that block first and pay the full-width build only for
     // seeds that will succeed. The `f` sets skip this: they succeed almost always, and their
     // column-moving detour straddles the block boundary.
-    if !P::SEMI_SYSTEMATIC && !square_block_is_invertible::<P>(&inv, &support) {
+    if !P::SEMI_SYSTEMATIC && !square_block_is_invertible::<P>(&inv, &support, &tables) {
         return false;
     }
 
-    // Row `i * m + k` of the matrix is bit-plane `k` of `alpha_j^i / g(alpha_j)`, so building
-    // the powers bit-sliced makes every row a straight copy of plane words and turns the
-    // per-element Horner step into one bit-sliced multiply per group of lanes. Lanes past
-    // `n` stay zero through every multiply, which keeps the rows' tail bits zero exactly as
-    // the byte-at-a-time build left them.
     let mut mat = BitMatrix::zeros(P::PK_NROWS, P::N);
-    let planes = P::M;
-    let groups = P::N.div_ceil(LANES);
-    let mut inv_sliced: Zeroizing<Vec<Word>> = Zeroizing::new(vec![0; groups * planes]);
-    let mut support_sliced: Zeroizing<Vec<Word>> = Zeroizing::new(vec![0; groups * planes]);
-    for (j, (&value, &alpha)) in inv.iter().zip(support.iter()).enumerate() {
-        let group = j / LANES;
-        let lane = j % LANES;
-        for plane in 0..planes {
-            inv_sliced[group * planes + plane] |= Word::from((value >> plane) & 1) << lane;
-            support_sliced[group * planes + plane] |= Word::from((alpha >> plane) & 1) << lane;
-        }
-    }
-
-    let tables = Tables::<P::Field>::new();
-    let read = |src: &[Word], group: usize| -> Slice {
-        let mut value: Slice = [0; MAX_BITS];
-        value[..planes].copy_from_slice(&src[group * planes..group * planes + planes]);
-        value
-    };
-    // Rows carry one padding word past the columns; it stays zero, so only the data words
-    // are written.
-    let data_words = P::N.div_ceil(64);
-    for i in 0..P::T {
-        for k in 0..planes {
-            let row = mat.row_words_mut(i * planes + k);
-            for (word, slot) in row[..data_words].iter_mut().enumerate() {
-                let plane = inv_sliced[(word / 2) * planes + k];
-                *slot = (plane >> (64 * (word % 2))) as u64;
-            }
-        }
-        if i + 1 == P::T {
-            break;
-        }
-        let mut product: Slice = [0; MAX_BITS];
-        for group in 0..groups {
-            let current = read(&inv_sliced, group);
-            let alpha = read(&support_sliced, group);
-            tables.mul(&mut product, &current, &alpha);
-            inv_sliced[group * planes..group * planes + planes].copy_from_slice(&product[..planes]);
-        }
-    }
+    build_power_rows::<P>(&mut mat, &inv, &support, &tables);
 
     // Reduce to systematic form, taking the semi-systematic detour at the last `mu` rows.
     //
