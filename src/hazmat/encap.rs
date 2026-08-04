@@ -136,7 +136,42 @@ pub(crate) fn encode<P: Params>(syndrome: &mut [u8], pk: &[u8], e: &[u8]) {
     // Indexed rather than chunked: the row length is an associated const of a type parameter,
     // which cannot appear as a const-generic argument, and the row number is wanted anyway.
     debug_assert_eq!(pk.len(), P::PK_NROWS * P::PK_ROW_BYTES);
-    for i in 0..P::PK_NROWS {
+
+    // The reduction streams the whole megabyte-class key once and is bound by memory, not
+    // arithmetic, so what matters is how many loads are in flight. One row at a time is one
+    // serial stream; four rows with independent accumulators keep four streams open, which
+    // is where sustained bandwidth comes from on every out-of-order core.
+    let mut i = 0;
+    while i + 4 <= P::PK_NROWS {
+        let (g0, rest0) = pk[i * P::PK_ROW_BYTES..(i + 1) * P::PK_ROW_BYTES].as_chunks::<8>();
+        let (g1, rest1) = pk[(i + 1) * P::PK_ROW_BYTES..(i + 2) * P::PK_ROW_BYTES].as_chunks::<8>();
+        let (g2, rest2) = pk[(i + 2) * P::PK_ROW_BYTES..(i + 3) * P::PK_ROW_BYTES].as_chunks::<8>();
+        let (g3, rest3) = pk[(i + 3) * P::PK_ROW_BYTES..(i + 4) * P::PK_ROW_BYTES].as_chunks::<8>();
+
+        let mut acc = [0u64; 4];
+        for (w, mask) in tail.iter().take(g0.len()).enumerate() {
+            acc[0] ^= u64::from_le_bytes(g0[w]) & mask;
+            acc[1] ^= u64::from_le_bytes(g1[w]) & mask;
+            acc[2] ^= u64::from_le_bytes(g2[w]) & mask;
+            acc[3] ^= u64::from_le_bytes(g3[w]) & mask;
+        }
+        if !rest0.is_empty() {
+            let mask = tail[words - 1];
+            for (slot, rest) in acc.iter_mut().zip([rest0, rest1, rest2, rest3]) {
+                let mut buf = [0u8; 8];
+                buf[..rest.len()].copy_from_slice(rest);
+                *slot ^= u64::from_le_bytes(buf) & mask;
+            }
+        }
+
+        for (r, &value) in acc.iter().enumerate() {
+            let bit = value.count_ones() as u8 & 1;
+            syndrome[(i + r) / 8] ^= bit << ((i + r) % 8);
+        }
+        i += 4;
+    }
+
+    while i < P::PK_NROWS {
         let row = &pk[i * P::PK_ROW_BYTES..(i + 1) * P::PK_ROW_BYTES];
         // Each whole word of the row is a fixed eight-byte copy, which compiles to one load.
         // Deriving the length per word instead, as a `min` against what is left of the row,
@@ -157,6 +192,7 @@ pub(crate) fn encode<P: Params>(syndrome: &mut [u8], pk: &[u8], e: &[u8]) {
 
         let bit = acc.count_ones() as u8 & 1;
         syndrome[i / 8] ^= bit << (i % 8);
+        i += 1;
     }
 }
 
