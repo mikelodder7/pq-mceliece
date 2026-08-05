@@ -310,6 +310,80 @@ unsafe fn minmax_adjacent_neon(values: *mut i32, p: usize) {
     }
 }
 
+/// Advance eight strided chains of the `p = 1` or `p = 2` stage through one whole `r`
+/// cascade, sixteen elements at a time.
+///
+/// The NEON twin of `small_stride_chain_x86`, with one simplification: both strides'
+/// residue classes fall inside a single four-lane register, so the window alignment is an
+/// `EXT` against zero within each register rather than a cross-register permute. Carries sit
+/// in lanes `p..2p-1` modulo `2p` and stay resident across the cascade; windows load at
+/// `base + r`, shift up `p` lanes to face them, and the maxima blend back into the window
+/// lanes only, leaving the interleaved foreign lanes untouched.
+///
+/// Running the cascades in lockstep over descending `r` preserves the scalar per-chain order
+/// exactly; the argument is the `small_stride_chain_x86` doc comment's. Same-`r` accesses of
+/// different chains touch distinct words, so the register order within one step is free. The
+/// carries fold back through a reload-and-blend because head lanes double as other chains'
+/// window words while the cascade is in flight.
+#[cfg(all(feature = "keygen", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn small_stride_chain_neon(base: *mut i32, q: usize, p: usize) {
+    use core::arch::aarch64::{
+        int32x4_t, vbslq_s32, vdupq_n_s32, vextq_s32, vld1q_s32, vld1q_u32, vmaxq_s32, vminq_s32,
+        vst1q_s32,
+    };
+
+    debug_assert!(p == 1 || p == 2);
+
+    // SAFETY: the caller guarantees sixteen writable elements at `base` and sixteen
+    // readable, writable elements at every `base + r` the cascade visits; `neon` is part of
+    // the AArch64 baseline and the load and store forms permit unaligned pointers.
+    unsafe {
+        let carry_lanes = if p == 1 {
+            [0u32, u32::MAX, 0, u32::MAX]
+        } else {
+            [0u32, 0, u32::MAX, u32::MAX]
+        };
+        let keep = vld1q_u32(carry_lanes.as_ptr());
+        let zero = vdupq_n_s32(0);
+
+        let mut carries: [int32x4_t; 4] = [
+            vld1q_s32(base),
+            vld1q_s32(base.add(4)),
+            vld1q_s32(base.add(8)),
+            vld1q_s32(base.add(12)),
+        ];
+
+        let mut r = q;
+        while r > p {
+            for (reg, carry) in carries.iter_mut().enumerate() {
+                let window = base.add(r + 4 * reg);
+                let w = vld1q_s32(window);
+                let aligned = if p == 1 {
+                    vextq_s32::<3>(zero, w)
+                } else {
+                    vextq_s32::<2>(zero, w)
+                };
+                let lo = vminq_s32(*carry, aligned);
+                let hi = vmaxq_s32(*carry, aligned);
+                *carry = vbslq_s32(keep, lo, *carry);
+                let back = if p == 1 {
+                    vextq_s32::<1>(hi, zero)
+                } else {
+                    vextq_s32::<2>(hi, zero)
+                };
+                vst1q_s32(window, vbslq_s32(keep, w, back));
+            }
+            r >>= 1;
+        }
+
+        for (reg, carry) in carries.iter().enumerate() {
+            let head = base.add(4 * reg);
+            vst1q_s32(head, vbslq_s32(keep, *carry, vld1q_s32(head)));
+        }
+    }
+}
+
 /// The compile-time-dispatched form of [`sort_packed_i32_power_of_two`]: NEON comparators on
 /// AArch64, the arithmetic-mask idiom everywhere else.
 #[cfg(feature = "keygen")]
@@ -387,6 +461,28 @@ fn sort_packed_i32_power_of_two_portable(x: &mut [i32]) {
         let mut q = top;
         while q > p {
             let limit = n - q;
+
+            // Strides one and two never reach the four-wide chain loop below, so their
+            // chains advance eight at a time in lockstep instead; see
+            // [`small_stride_chain_neon`] for why the order is preserved. `index` stays a
+            // multiple of `2p` across levels, which is the alignment the batch's residue
+            // classes assume.
+            #[cfg(target_arch = "aarch64")]
+            if p <= 2 {
+                while index + 16 <= limit {
+                    // SAFETY: `index + 16 <= limit = n - q` keeps the sixteen carry words
+                    // in bounds and every window below `index + q + 15 <= n - 1`.
+                    unsafe {
+                        if p == 1 {
+                            small_stride_chain_neon(x.as_mut_ptr().add(index), q, 1);
+                        } else {
+                            small_stride_chain_neon(x.as_mut_ptr().add(index), q, 2);
+                        }
+                    }
+                    index += 16;
+                }
+            }
+
             while index < limit {
                 let block_end = (index | (p - 1)) + 1;
                 if index & p != 0 {
