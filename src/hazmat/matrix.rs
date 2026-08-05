@@ -257,11 +257,75 @@ fn xor_sixteen_sources_pair(
         first,
         conditions,
     );
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    xor_sources_pair_neon(destinations, sources, stride, first, conditions);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let (first_row, second_row) = destinations.split_at_mut(stride);
         xor_sixteen_sources(first_row, sources, stride, first, &conditions[0]);
         xor_sixteen_sources(second_row, sources, stride, first, &conditions[1]);
+    }
+}
+
+/// The NEON pair form: sixteen masked sources folded into two destination rows with every
+/// source chunk loaded once for both.
+///
+/// The single-destination asm kernel keeps its sixteen masks resident in vector registers;
+/// a pair needs thirty-two, which do not fit, so the masks live in a small table instead and
+/// arrive as one-word broadcast loads. The exchange trades one streaming source load per
+/// chunk against two cache-resident mask loads.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn xor_sources_pair_neon(
+    destinations: &mut [u64],
+    sources: &[u64],
+    stride: usize,
+    first: usize,
+    conditions: &[[u64; 16]; 2],
+) {
+    use core::arch::aarch64::{vandq_u64, veorq_u64, vld1q_dup_u64, vld1q_u64, vst1q_u64};
+
+    debug_assert_eq!(destinations.len(), 2 * stride);
+    debug_assert_eq!(sources.len(), 16 * stride);
+
+    let masks: [[u64; 2]; 16] = core::array::from_fn(|r| {
+        [
+            0u64.wrapping_sub(conditions[0][r]),
+            0u64.wrapping_sub(conditions[1][r]),
+        ]
+    });
+
+    // SAFETY: the two destination rows and the sixteen source rows are disjoint borrows of
+    // `stride` words each, every pointer below stays inside them, and `neon` is part of the
+    // AArch64 baseline. The chunk loop runs while `i + 2 <= stride` and the scalar column
+    // covers a trailing odd word.
+    unsafe {
+        let d = destinations.as_mut_ptr();
+        let mut i = first;
+        while i + 2 <= stride {
+            let mut low = vld1q_u64(d.add(i));
+            let mut high = vld1q_u64(d.add(stride + i));
+            for (r, pair) in masks.iter().enumerate() {
+                let source = vld1q_u64(sources.as_ptr().add(r * stride + i));
+                low = veorq_u64(low, vandq_u64(source, vld1q_dup_u64(&pair[0])));
+                high = veorq_u64(high, vandq_u64(source, vld1q_dup_u64(&pair[1])));
+            }
+            vst1q_u64(d.add(i), low);
+            vst1q_u64(d.add(stride + i), high);
+            i += 2;
+        }
+
+        if i < stride {
+            let mut low = destinations[i];
+            let mut high = destinations[stride + i];
+            for (r, pair) in masks.iter().enumerate() {
+                let source = sources[r * stride + i];
+                low ^= source & pair[0];
+                high ^= source & pair[1];
+            }
+            destinations[i] = low;
+            destinations[stride + i] = high;
+        }
     }
 }
 
