@@ -280,6 +280,36 @@ pub(crate) fn sort_packed_i32_power_of_two(x: &mut [i32]) {
     sort_packed_i32_power_of_two_portable(x)
 }
 
+/// One vector of the contiguous stage at stride one or two: each `2p` block's halves compare
+/// in place, with an in-register swap standing in for the second stream.
+///
+/// The NEON twin of `minmax_adjacent_x86`: `REV64` faces stride-one partners, `EXT` by two
+/// lanes faces stride-two partners, and a bit-select keeps each maximum in its high lane.
+/// Both strides divide the four-lane vector, so whole blocks are always covered.
+#[cfg(all(feature = "keygen", target_arch = "aarch64"))]
+#[inline(always)]
+unsafe fn minmax_adjacent_neon(values: *mut i32, p: usize) {
+    use core::arch::aarch64::{
+        vbslq_s32, vextq_s32, vld1q_s32, vld1q_u32, vmaxq_s32, vminq_s32, vrev64q_s32, vst1q_s32,
+    };
+
+    debug_assert!(p == 1 || p == 2);
+
+    // SAFETY: the caller provides four writable elements, and `neon` is part of the AArch64
+    // baseline. The load and store forms permit unaligned pointers.
+    unsafe {
+        let v = vld1q_s32(values);
+        let (partner, keep_max) = if p == 1 {
+            (vrev64q_s32(v), [0u32, u32::MAX, 0, u32::MAX])
+        } else {
+            (vextq_s32::<2>(v, v), [0u32, 0, u32::MAX, u32::MAX])
+        };
+        let lo = vminq_s32(v, partner);
+        let hi = vmaxq_s32(v, partner);
+        vst1q_s32(values, vbslq_s32(vld1q_u32(keep_max.as_ptr()), hi, lo));
+    }
+}
+
 /// The compile-time-dispatched form of [`sort_packed_i32_power_of_two`]: NEON comparators on
 /// AArch64, the arithmetic-mask idiom everywhere else.
 #[cfg(feature = "keygen")]
@@ -293,8 +323,39 @@ fn sort_packed_i32_power_of_two_portable(x: &mut [i32]) {
     let top = n >> 1;
     let mut p = top;
     while p > 0 {
+        // At strides one and two, whole `2p` blocks fit inside one vector, so the stage runs
+        // as an in-register swap-compare-blend per four lanes; the scalar walk below covers
+        // inputs shorter than a vector.
+        #[cfg(target_arch = "aarch64")]
+        let contiguous_done = p <= 2 && {
+            let mut k = 0;
+            while k + 4 <= n {
+                // SAFETY: `k + 4 <= n` keeps the four elements in bounds.
+                unsafe {
+                    if p == 1 {
+                        minmax_adjacent_neon(x.as_mut_ptr().add(k), 1);
+                    } else {
+                        minmax_adjacent_neon(x.as_mut_ptr().add(k), 2);
+                    }
+                }
+                k += 4;
+            }
+            while k < n {
+                let (left, right) = x[k..k + 2 * p].split_at_mut(p);
+                for (a, b) in left.iter_mut().zip(right.iter_mut()) {
+                    let (lo, hi) = minmax_packed_i32(*a, *b);
+                    *a = lo;
+                    *b = hi;
+                }
+                k += 2 * p;
+            }
+            true
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let contiguous_done = false;
+
         let mut base = 0;
-        while base < n {
+        while !contiguous_done && base < n {
             let (left, right) = x[base..base + 2 * p].split_at_mut(p);
             // The two halves are contiguous and disjoint, which is exactly the comparator's
             // shape, so the vector form applies directly. `p` is a power of two, so the
