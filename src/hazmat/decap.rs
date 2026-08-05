@@ -530,7 +530,7 @@ pub(crate) fn cond_words<P: Params>() -> usize {
 /// order, `valid` the mask of elements that carry a real code position, and `conds` the
 /// network's control words in prepared per-stage form. None of them reads the ciphertext, so a
 /// holder that decapsulates repeatedly under one key can do this once instead of once per
-/// message. It is roughly a third of the cost of a decapsulation.
+/// message. It is roughly a quarter of the cost of a decapsulation.
 pub(crate) fn prepare<P: Params>(
     sk: &[u8],
     scale: &mut [Word],

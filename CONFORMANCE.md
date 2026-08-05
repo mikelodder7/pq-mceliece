@@ -160,16 +160,19 @@ other rather than only against the KAT vectors.
 
 | Primitive | AArch64 | x86-64 | Portable |
 | --------- | ------- | ------ | -------- |
-| Bit-matrix row XOR, 1 and 8 and 16 wide | inline assembly, NEON | `vpternlogq` on AVX-512, `vpand`/`vpxor` on AVX2 | word loop |
-| Sorting-network comparator, 4 wide | NEON `vminq_s32`/`vmaxq_s32` | scalar (measured: vectorizing it is slower) | scalar |
+| Bit-matrix row XOR: 1, 8 and 16 wide, paired-destination, and panel-fold forms | inline assembly and NEON intrinsics | `vpternlogq` on AVX-512, `vpand`/`vpxor` on AVX2 | blocked word loops with the same one-pass schedule |
+| Bit-sliced field multiply and square | NEON; the inner step fuses to `BCAX` where the `sha3` extension is available | SSE2 baseline; fused single and paired 256-bit forms via `vpternlogq` on AVX-512 | `u128` Karatsuba |
+| Sorting-network comparators, contiguous short-stride stages, and lockstep chain batches | NEON `SMIN`/`SMAX` with `EXT`/`REV64` alignment and `BSL` blends | `pminsd`/`pmaxsd` tiers on SSE4.1 and AVX2, selected at run time | scalar arithmetic mask |
 | Carry-less multiply | `vmull_p64` when `aes` is enabled | portable convolution (measured: faster than `pclmulqdq` here) | 13-term convolution |
+| 64x64 bit transpose | shared delta-form word code | shared | shared |
 
 Selection on x86-64 is a run-time decision made once per process from CPUID, cached in an
 atomic, and never data dependent. Setting `PQ_MCELIECE_DISABLE_SIMD` to a non-empty value
-forces the scalar row kernels and disables the fused multiply on x86-64 (the baseline SSE2
-field multiply and the AArch64 NEON kernels are unconditional); CI runs the test suite under
-both settings and the results must be identical, and the differential unit tests additionally
-check every vector kernel against its scalar twin inside one binary.
+forces the scalar tier on x86-64 — the row kernels, the sorting-network kernels, and the
+fused and paired multiplies (the baseline SSE2 field multiply and the AArch64 NEON kernels
+are compile-time and unconditional); CI runs the test suite under both settings and the
+results must be identical, and the differential unit tests additionally check every vector
+kernel against its scalar twin inside one binary.
 
 The portable carry-less multiply is a fixed 13-term convolution built on integer
 multiplication. On mainstream CPUs integer multiply latency is operand independent; on the
@@ -188,9 +191,10 @@ timing channel for the speed.
 
 ### Constant-time audit of the vectorized paths
 
-Every kernel added for x86 was audited against the property the data-oblivious design exists to
-provide: **no branch, no memory address, and no shift count may depend on a secret.** What that
-allows and forbids, concretely:
+Every vector kernel — the x86 tiers and the AArch64 assembly and intrinsics alike — was
+audited against the property the data-oblivious design exists to provide: **no branch, no
+memory address, and no shift count may depend on a secret.** What that allows and forbids,
+concretely:
 
 - A secret bit becomes an all-zeros or all-ones mask by wrapping negation and reaches only the
   operand of an `AND`. It never reaches a comparison, a jump, or an index.

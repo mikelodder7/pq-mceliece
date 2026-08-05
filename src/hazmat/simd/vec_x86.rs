@@ -234,6 +234,7 @@ pub(crate) unsafe fn mul_fused<const BITS: usize>(
 /// # Safety
 ///
 /// The host must support `avx512f` and `avx512vl`.
+#[cfg(any(feature = "decapsulate", test))]
 #[target_feature(enable = "avx512f,avx512vl")]
 pub(crate) unsafe fn mul_fused_pair<const BITS: usize>(
     out: (&mut [u128; MAX_BITS], &mut [u128; MAX_BITS]),
@@ -364,6 +365,7 @@ unsafe fn fused_and_xor(a: __m128i, b: __m128i, c: __m128i) -> __m128i {
 /// # Safety
 ///
 /// The host must support `avx512f` and `avx512vl`; the 256-bit width is what needs `vl`.
+#[cfg(any(feature = "decapsulate", test))]
 #[target_feature(enable = "avx512f,avx512vl")]
 #[inline]
 unsafe fn fused_and_xor_pair(
@@ -376,6 +378,7 @@ unsafe fn fused_and_xor_pair(
 }
 
 /// The 256-bit exclusive-or, named so the shared Karatsuba body can take it as a parameter.
+#[cfg(any(feature = "decapsulate", test))]
 #[inline(always)]
 fn xor_pair(
     a: core::arch::x86_64::__m256i,
@@ -387,6 +390,7 @@ fn xor_pair(
 }
 
 /// Two bit-planes side by side in one 256-bit register.
+#[cfg(any(feature = "decapsulate", test))]
 #[inline(always)]
 fn pack_pair(low: u128, high: u128) -> core::arch::x86_64::__m256i {
     use core::arch::x86_64::{_mm256_inserti128_si256, _mm256_zextsi128_si256};
@@ -395,6 +399,7 @@ fn pack_pair(low: u128, high: u128) -> core::arch::x86_64::__m256i {
 }
 
 /// The low half of a packed pair.
+#[cfg(any(feature = "decapsulate", test))]
 #[inline(always)]
 fn low_half(value: core::arch::x86_64::__m256i) -> u128 {
     // SAFETY: as in `xor_pair`.
@@ -402,6 +407,7 @@ fn low_half(value: core::arch::x86_64::__m256i) -> u128 {
 }
 
 /// The high half of a packed pair.
+#[cfg(any(feature = "decapsulate", test))]
 #[inline(always)]
 fn high_half(value: core::arch::x86_64::__m256i) -> u128 {
     // SAFETY: as in `xor_pair`.

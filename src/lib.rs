@@ -850,8 +850,8 @@ impl DecapsulationKey {
 
     /// Precompute the key-derived part of decoding, for repeated decapsulation.
     ///
-    /// About a third of a decapsulation depends only on the private key, not on the message.
-    /// Doing it once here rather than once per ciphertext is worth roughly a third off each
+    /// About a quarter of a decapsulation depends only on the private key, not on the message.
+    /// Doing it once here rather than once per ciphertext is worth roughly a quarter off each
     /// subsequent [`PreparedDecapsulationKey::decapsulate`], at the cost of holding the derived
     /// material alongside the key. Decapsulating a single message is not worth preparing for.
     pub fn prepare(&self) -> PreparedDecapsulationKey {
@@ -1595,9 +1595,9 @@ mod tests {
 
         serde_round_trip!(json, serde_json::to_string, serde_json::from_str);
         serde_round_trip!(toml, toml::to_string, toml::from_str);
-        serde_round_trip!(yaml, serde_yaml::to_string, serde_yaml::from_str);
+        serde_round_trip!(yaml, yaml_serde::to_string, yaml_serde::from_str);
         serde_round_trip!(bare, serde_bare::to_vec, serde_bare::from_slice);
-        serde_round_trip!(cbor, serde_cbor::to_vec, serde_cbor::from_slice);
+        serde_round_trip!(cbor, serde_cbor_2::to_vec, serde_cbor_2::from_slice);
         serde_round_trip!(postcard, postcard::to_stdvec, postcard::from_bytes);
     }
 }

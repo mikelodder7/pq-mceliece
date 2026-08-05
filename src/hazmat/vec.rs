@@ -282,6 +282,7 @@ impl<F: Field> Tables<F> {
     /// Berlekamp--Massey scales two polynomials by two independent constants at every step;
     /// pairing the multiplies halves the fused convolution's instruction count on AVX-512
     /// hosts. Everywhere else this is exactly two calls to [`Tables::mul`], in order.
+    #[cfg(any(feature = "decapsulate", test))]
     pub(crate) fn mul_pair(
         &self,
         out: (&mut Slice, &mut Slice),

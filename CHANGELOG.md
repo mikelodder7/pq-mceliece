@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-08-05
+
+### Changed
+
+- Performance improvements for arm, x86, and portable.
+- Test-only: serialization round-trips now exercise the maintained `serde_cbor_2` and
+  `yaml_serde` crates in place of the unmaintained `serde_cbor` and `serde_yaml`.
+
+### Fixed
+
+- The SHAKE256 state that absorbs the key-generation seed and the encapsulated error vector
+  is now wiped on drop, via the `shake` crate's `zeroize` feature. Previously that state was
+  the one secret-absorbing buffer that outlived its use unwiped.
+
 ## [0.2.1] - 2026-08-03
 
 ### Fixed
@@ -64,6 +78,7 @@ Initial release.
   selected) and AArch64 (NEON), each checked against its scalar twin, plus a `dudect`
   statistical timing test suite.
 
+[0.3.0]: https://github.com/mikelodder7/pq-mceliece/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/mikelodder7/pq-mceliece/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/mikelodder7/pq-mceliece/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mikelodder7/pq-mceliece/releases/tag/v0.1.0

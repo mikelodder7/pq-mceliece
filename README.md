@@ -180,7 +180,9 @@ the type-level constants up to `U1357824`, so it is a noticeable compile-time sa
 ## Performance
 
 Classic McEliece has small ciphertexts, fast encapsulation, and large keys with expensive key
-generation. Generate keys rarely and keep them.
+generation. Generate keys rarely and keep them. Measured comparisons against
+`classic-mceliece-rust` and PQClean, with methodology, live in
+[benches/comparison/RESULTS.md](https://github.com/mikelodder7/pq-mceliece/blob/main/benches/comparison/RESULTS.md).
 
 ### Build flags
 
@@ -205,7 +207,7 @@ and measure with the machine otherwise idle.
 
 ### Decapsulating repeatedly under one key
 
-Roughly a third of a decapsulation depends only on the private key rather than on the message.
+Roughly a quarter of a decapsulation depends only on the private key rather than on the message.
 A holder that decapsulates many ciphertexts under one key can do that part once:
 
 ```rust

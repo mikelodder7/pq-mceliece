@@ -1,13 +1,13 @@
 # Comparison results
 
-Measured 2026-08-03 on an Apple M2 Max MacBook Pro (12 cores: 8 performance + 4 efficiency,
+Measured 2026-08-05 on an Apple M2 Max MacBook Pro (12 cores: 8 performance + 4 efficiency,
 64 GB RAM), `aarch64-apple-darwin`, Darwin 25.5.0, rustc 1.97.1. The command was
 `benches/comparison/run-all.sh`, with the normal Cargo bench profile and no `RUSTFLAGS`.
 PQClean therefore used its portable C implementation; its AVX2 implementation is available only
 on supported x86 machines.
 
 The compared versions were `classic-mceliece-rust` 3.1.0 and
-`pqcrypto-classicmceliece` 0.2.1 against the current `pq-mceliece` 0.2.1 checkout. Criterion used
+`pqcrypto-classicmceliece` 0.2.1 against the current `pq-mceliece` 0.3.0 checkout. Criterion used
 a 1 second warm-up and 3 second requested measurement window. Key generation used 10 samples;
 encapsulation and decapsulation used 100. Criterion lengthened the window where an operation was
 too slow to collect that many samples. Values below are Criterion's regression estimate when
@@ -32,50 +32,50 @@ All shared secrets are 32 bytes.
 
 | Parameter set | `pq-mceliece` | `classic-mceliece-rust` | PQClean |
 | --- | ---: | ---: | ---: |
-| mceliece348864 | 27.34 ms | 206.8 ms | 210.4 ms |
-| mceliece348864f | 13.23 ms | 74.61 ms | 67.43 ms |
-| mceliece460896 | 80.99 ms | 764.0 ms | 661.5 ms |
-| mceliece460896f | 40.67 ms | 255.7 ms | 227.3 ms |
-| mceliece6688128 | 214.5 ms | 1,314 ms | 1,637 ms |
-| mceliece6688128f | 70.56 ms | 509.9 ms | 488.8 ms |
-| mceliece6960119 | 174.8 ms | 1,833 ms | 1,326 ms |
-| mceliece6960119f | 64.37 ms | 467.4 ms | 454.6 ms |
-| mceliece8192128 | 176.7 ms | 2,507 ms | 1,452 ms |
-| mceliece8192128f | 83.23 ms | 624.5 ms | 605.7 ms |
+| mceliece348864 | 15.89 ms | 207.1 ms | 175.2 ms |
+| mceliece348864f | 9.99 ms | 73.86 ms | 66.96 ms |
+| mceliece460896 | 47.99 ms | 755.0 ms | 628.9 ms |
+| mceliece460896f | 28.38 ms | 237.6 ms | 224.5 ms |
+| mceliece6688128 | 102.7 ms | 1,336 ms | 1,416 ms |
+| mceliece6688128f | 54.86 ms | 521.4 ms | 487.3 ms |
+| mceliece6960119 | 84.52 ms | 1,823 ms | 1,043 ms |
+| mceliece6960119f | 47.99 ms | 464.6 ms | 444.5 ms |
+| mceliece8192128 | 106.9 ms | 2,380 ms | 2,082 ms |
+| mceliece8192128f | 64.09 ms | 612.6 ms | 596.8 ms |
 
 Non-`f` key generation uses rejection sampling and had wide 95% confidence intervals in this
-short run. For example, PQClean `mceliece6688128` was 0.82–2.55 seconds. The `f` results were much
+short run. For example, PQClean `mceliece6688128` was 0.69–2.33 seconds. The `f` results were much
 more stable.
 
 ## Encapsulation
 
 | Parameter set | `pq-mceliece` | `classic-mceliece-rust` | PQClean |
 | --- | ---: | ---: | ---: |
-| mceliece348864 | 6.838 µs | 14.42 µs | 18.65 µs |
-| mceliece348864f | 6.771 µs | 14.50 µs | 18.43 µs |
-| mceliece460896 | 15.14 µs | 25.27 µs | 40.09 µs |
-| mceliece460896f | 15.56 µs | 26.12 µs | 40.22 µs |
-| mceliece6688128 | 26.32 µs | 54.31 µs | 100.5 µs |
-| mceliece6688128f | 26.64 µs | 54.62 µs | 95.45 µs |
-| mceliece6960119 | 27.30 µs | 77.66 µs | 111.0 µs |
-| mceliece6960119f | 27.29 µs | 77.90 µs | 111.3 µs |
-| mceliece8192128 | 31.96 µs | 53.13 µs | 72.59 µs |
-| mceliece8192128f | 30.67 µs | 51.26 µs | 71.19 µs |
+| mceliece348864 | 7.981 µs | 14.26 µs | 18.54 µs |
+| mceliece348864f | 8.112 µs | 14.26 µs | 18.58 µs |
+| mceliece460896 | 14.70 µs | 25.07 µs | 39.90 µs |
+| mceliece460896f | 14.67 µs | 24.93 µs | 39.68 µs |
+| mceliece6688128 | 30.32 µs | 55.05 µs | 109.0 µs |
+| mceliece6688128f | 29.80 µs | 54.85 µs | 110.0 µs |
+| mceliece6960119 | 30.10 µs | 77.74 µs | 111.6 µs |
+| mceliece6960119f | 30.03 µs | 80.16 µs | 110.5 µs |
+| mceliece8192128 | 28.85 µs | 53.22 µs | 73.15 µs |
+| mceliece8192128f | 27.96 µs | 50.78 µs | 70.38 µs |
 
 ## Decapsulation
 
 | Parameter set | `pq-mceliece` | `classic-mceliece-rust` | PQClean |
 | --- | ---: | ---: | ---: |
-| mceliece348864 | 0.0862 ms | 5.237 ms | 16.85 ms |
-| mceliece348864f | 0.0862 ms | 5.064 ms | 17.04 ms |
-| mceliece460896 | 0.2355 ms | 38.55 ms | 41.05 ms |
-| mceliece460896f | 0.2347 ms | 38.41 ms | 41.00 ms |
-| mceliece6688128 | 0.2779 ms | 73.83 ms | 77.37 ms |
-| mceliece6688128f | 0.2767 ms | 73.85 ms | 77.40 ms |
-| mceliece6960119 | 0.2456 ms | 71.39 ms | 74.93 ms |
-| mceliece6960119f | 0.2468 ms | 72.45 ms | 78.98 ms |
-| mceliece8192128 | 0.2861 ms | 96.19 ms | 96.20 ms |
-| mceliece8192128f | 0.2792 ms | 91.45 ms | 97.24 ms |
+| mceliece348864 | 0.0689 ms | 5.308 ms | 17.13 ms |
+| mceliece348864f | 0.0689 ms | 5.114 ms | 17.20 ms |
+| mceliece460896 | 0.1359 ms | 38.94 ms | 40.92 ms |
+| mceliece460896f | 0.1354 ms | 39.22 ms | 40.76 ms |
+| mceliece6688128 | 0.1614 ms | 75.24 ms | 78.62 ms |
+| mceliece6688128f | 0.1617 ms | 75.21 ms | 78.62 ms |
+| mceliece6960119 | 0.1402 ms | 72.57 ms | 76.20 ms |
+| mceliece6960119f | 0.1398 ms | 72.64 ms | 76.00 ms |
+| mceliece8192128 | 0.1696 ms | 96.28 ms | 99.40 ms |
+| mceliece8192128f | 0.1615 ms | 91.82 ms | 96.22 ms |
 
 These are end-to-end public-API timings, including each API's returned-value construction and
 allocation behavior. The Rust implementations receive seeded ChaCha8 RNGs compatible with their

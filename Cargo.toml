@@ -12,7 +12,7 @@ name = "pq-mceliece"
 readme = "README.md"
 repository = "https://github.com/mikelodder7/pq-mceliece"
 rust-version = "1.89"
-version = "0.2.1"
+version = "0.3.0"
 
 [features]
 default = ["nist", "iso", "serde", "keygen", "encapsulate", "decapsulate", "kem"]
@@ -100,7 +100,7 @@ serde = ["dep:hex", "dep:serde"]
 [dependencies]
 ctutils = "0.4"
 hex = { version = "0.4", optional = true }
-hybrid-array = { version = "0.4.13", features = ["extra-sizes"], optional = true }
+hybrid-array = { version = "0.4.14", features = ["extra-sizes"], optional = true }
 kem = { version = "0.3", optional = true }
 rand_core = { version = "0.10", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
@@ -130,10 +130,10 @@ postcard = { version = "1.0", features = ["use-std"] }
 rand = { version = "0.10", features = ["sys_rng"] }
 rand_chacha = "0.10"
 serde_bare = "0.5"
-serde_cbor = "0.11"
+serde_cbor_2 = "0.13"
 serde_json = "1.0"
-serde_yaml = "0.9"
 toml = "1.1.0"
+yaml_serde = "0.10"
 
 [package.metadata.docs.rs]
 features = ["nist", "iso", "hazmat", "serde", "keygen", "encapsulate", "decapsulate", "kem"]
