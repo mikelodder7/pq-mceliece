@@ -873,6 +873,106 @@ fn clear_rows(
     }
 }
 
+/// How many trailing rows stream past the register-resident panel rows per tile.
+///
+/// Tiling bounds the strided working set of one chunk-column pass to `TRAILING_TILE` cache
+/// lines, so successive chunk columns of the same tile hit cache instead of walking the whole
+/// trailing region again.
+#[cfg(target_arch = "aarch64")]
+const TRAILING_TILE: usize = 64;
+
+/// Fold every trailing row into eight register-resident panel rows, tile by tile.
+///
+/// The NEON twin of `matrix_x86::fold_trailing_if`: the eight panel accumulators live in
+/// vector registers for a whole tile of trailing rows, so the fold costs one source load and
+/// eight AND-XOR pairs per trailing row chunk instead of eight destination loads and stores
+/// each. The per-tile parity masks are precomputed into a table and reach the fold as
+/// one-word broadcast loads. XOR commutes, so the inverted fold order leaves every row
+/// bit-identical; the masks are the same parities as before and no secret reaches a branch
+/// or an address.
+#[cfg(target_arch = "aarch64")]
+fn fold_trailing_neon(
+    panel: &mut [u64],
+    trailing: &[u64],
+    stride: usize,
+    first: usize,
+    carried: &[u64; 8],
+    taken: &[u64],
+) {
+    use core::arch::aarch64::{vandq_u64, veorq_u64, vld1q_dup_u64, vld1q_u64, vst1q_u64};
+
+    debug_assert_eq!(panel.len(), 8 * stride);
+    let trailing_rows = taken.len();
+    debug_assert_eq!(trailing.len(), trailing_rows * stride);
+
+    let mut masks = [[0u64; 8]; TRAILING_TILE];
+    let mut tile_start = 0;
+    while tile_start < trailing_rows {
+        let tile_end = (tile_start + TRAILING_TILE).min(trailing_rows);
+
+        // The parity masks depend on the trailing row alone, so they are computed once per
+        // tile; inside the fold each mask arrives as a one-word broadcast load from this
+        // table, which stays cache-resident for the whole tile.
+        for (slots, t) in masks.iter_mut().zip(tile_start..tile_end) {
+            let took = taken[t];
+            for (slot, &row_carried) in slots.iter_mut().zip(carried.iter()) {
+                *slot = 0u64.wrapping_sub(u64::from((row_carried & took).count_ones() & 1));
+            }
+        }
+
+        // SAFETY: every pointer below stays inside `panel` (eight rows of `stride` words) or
+        // `trailing` (`trailing_rows` rows of `stride` words), the two regions are disjoint
+        // borrows, and `neon` is part of the AArch64 baseline. The chunk loop runs while
+        // `i + 2 <= stride` and the scalar column below covers a trailing odd word.
+        unsafe {
+            let p = panel.as_mut_ptr();
+            let mut i = first;
+            while i + 2 <= stride {
+                let mut accs = [
+                    vld1q_u64(p.add(i)),
+                    vld1q_u64(p.add(stride + i)),
+                    vld1q_u64(p.add(2 * stride + i)),
+                    vld1q_u64(p.add(3 * stride + i)),
+                    vld1q_u64(p.add(4 * stride + i)),
+                    vld1q_u64(p.add(5 * stride + i)),
+                    vld1q_u64(p.add(6 * stride + i)),
+                    vld1q_u64(p.add(7 * stride + i)),
+                ];
+
+                for (slots, t) in masks.iter().zip(tile_start..tile_end) {
+                    let source = vld1q_u64(trailing.as_ptr().add(t * stride + i));
+                    for (acc, mask) in accs.iter_mut().zip(slots.iter()) {
+                        *acc = veorq_u64(*acc, vandq_u64(source, vld1q_dup_u64(mask)));
+                    }
+                }
+
+                for (row, acc) in accs.into_iter().enumerate() {
+                    vst1q_u64(p.add(row * stride + i), acc);
+                }
+                i += 2;
+            }
+
+            if i < stride {
+                let mut accs = [0u64; 8];
+                for (row, slot) in accs.iter_mut().enumerate() {
+                    *slot = panel[row * stride + i];
+                }
+                for (slots, t) in masks.iter().zip(tile_start..tile_end) {
+                    let source = trailing[t * stride + i];
+                    for (acc, &mask) in accs.iter_mut().zip(slots.iter()) {
+                        *acc ^= source & mask;
+                    }
+                }
+                for (row, &value) in accs.iter().enumerate() {
+                    panel[row * stride + i] = value;
+                }
+            }
+        }
+
+        tile_start = tile_end;
+    }
+}
+
 /// What the narrow phase of a panel decides, to be replayed wide.
 ///
 /// Each panel row's final content is
@@ -1398,17 +1498,19 @@ impl BitMatrix {
             let (before, rest) = self.data.split_at_mut(trailing_start);
             let block = &mut before[block_start..block_start + COUNT * stride];
 
-            if cfg!(target_arch = "x86_64") && COUNT.is_multiple_of(8) {
+            if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) && COUNT.is_multiple_of(8)
+            {
                 // Eight panel rows at a time ride in registers while the whole trailing
                 // stream folds past them; the parity conditions are recomputed from
                 // `carried` inside the kernel.
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
                 {
                     let trailing_rows = rest.len() / stride;
                     let taken = &scratch.direct[start + COUNT..start + COUNT + trailing_rows];
                     for (group, rows) in block.chunks_exact_mut(8 * stride).enumerate() {
                         let mut group_carried = [0u64; 8];
                         group_carried.copy_from_slice(&carried[8 * group..8 * group + 8]);
+                        #[cfg(target_arch = "x86_64")]
                         super::simd::matrix_x86::fold_trailing_if(
                             rows,
                             rest,
@@ -1417,6 +1519,8 @@ impl BitMatrix {
                             &group_carried,
                             taken,
                         );
+                        #[cfg(target_arch = "aarch64")]
+                        fold_trailing_neon(rows, rest, stride, first, &group_carried, taken);
                     }
                 }
             } else {
